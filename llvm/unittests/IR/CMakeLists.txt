@@ -70,3 +70,8 @@ add_llvm_unittest(VMCallbackLogRecordReplayTests
   )
 
 target_link_libraries(VMCallbackLogRecordReplayTests PRIVATE LLVMTestingSupport)
+
+add_llvm_unittest(JavaTypeQueryTests
+  PARTIAL_SOURCES_INTENDED
+  JavaTypeQueryTest.cpp
+  )

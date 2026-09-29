@@ -16,7 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
-#include "llvm/Analysis/LazyValueInfo.h"
+#include "llvm/Analysis/Jeandle/JavaTypeAnalysis.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
@@ -26,7 +26,6 @@
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Transforms/Jeandle/JeandleTransformUtils.h"
 
 #define DEBUG_TYPE "type-check-elimination"
 
@@ -67,14 +66,7 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
   if (!CheckFn && !SubtypeFn)
     return PreservedAnalyses::all();
 
-  DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-  // The LVI snapshot stays safe for the whole pass because TCE only erases
-  // non-terminator CallInsts and never splits blocks: LVI's ValueHandles purge
-  // erased/RAUW'd values from its caches, and block-value state stays valid
-  // while the CFG is unchanged. A fold that touches terminators or blocks
-  // would need to drop the oracle first.
-  LazyValueInfo &LVI = FAM.getResult<LazyValueAnalysis>(F);
-  LVINullEdgeOracle IsNullEdge{LVI};
+  auto &JavaTypes = FAM.getResult<jeandle::JavaTypeAnalysis>(F);
 
   // Collect check_instanceof and check_klass_subtype calls. CallInst only:
   // the check helpers are never emitted as invokes, and an invoke must not be
@@ -136,8 +128,7 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     // helper's IR contract requires this oop operand to be non-null, so
     // check_instanceof-derived sharpening remains sound even though JavaType
     // itself does not model nullability.
-    jeandle::JavaType ObjType =
-        jeandle::getJavaType(Obj, &DT, CheckCB, IsNullEdge);
+    jeandle::JavaType ObjType = JavaTypes.getJavaType(Obj, CheckCB);
 
     // --- Fold to true: known subtype ---
     if (ObjType.isKnown() && (CB->IsSubtype(ObjType.Klass, SuperKlass) ||
@@ -180,6 +171,9 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
 
   if (!Changed)
     return PreservedAnalyses::all();
+
+  // 所有查询都在修改前完成；批量折叠后清理基础类型及路径事实缓存。
+  JavaTypes.clear();
 
   PreservedAnalyses PA;
   PA.preserveSet<CFGAnalyses>();

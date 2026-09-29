@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Jeandle/ArrayCopySpecialization.h"
+#include "llvm/Analysis/Jeandle/LVINullEdgeOracle.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Dominators.h"

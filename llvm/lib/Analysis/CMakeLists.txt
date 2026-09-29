@@ -163,6 +163,9 @@ add_llvm_component_library(LLVMAnalysis
   ${GeneratedMLSources}
   Jeandle/DeoptPoolBundleLowering.cpp
   Jeandle/DeoptPoolPlanner.cpp
+  Jeandle/CachedJavaType.cpp
+  Jeandle/JavaTypeAnalysis.cpp
+  Jeandle/LVINullEdgeOracle.cpp
   Jeandle/PartialEscape.cpp
   Jeandle/PartialEscapeAnalysis.cpp
   Jeandle/PartialEscapeUtils.cpp
