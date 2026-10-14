@@ -61,8 +61,8 @@ public:
     FinalTypes.clear();
   }
   /// Invalidate Changed and its transitive SSA users before mutation. Changes
-  /// reaching calls or terminators also discard all contextual results, since
-  /// these may affect guards and LVI facts about otherwise unrelated values.
+  /// reaching calls, memory accesses or terminators also discard all contextual
+  /// results: they may affect guards and LVI facts about unrelated values.
   /// CFGChanged additionally discards all derived base results; direct leaf
   /// types survive unless affected by Changed. Every erased value must be
   /// notified while still live, including values in erased blocks. Structural

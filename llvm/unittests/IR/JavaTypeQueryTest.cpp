@@ -748,4 +748,41 @@ TEST_F(JavaTypeQueryTest, InvalidationWorkLimitFallsBackToClear) {
   EXPECT_EQ(Cache.baseSize(), 0U);
 }
 
+TEST_F(JavaTypeQueryTest, DereferenceChangeDropsContextualResults) {
+  Function *F = parse(R"(
+    declare i1 @jeandle.check_instanceof(ptr, ptr nonnull)
+    define void @test(ptr %obj, ptr %address) {
+    entry:
+      store i8 0, ptr %address
+      %check = call i1 @jeandle.check_instanceof(ptr inttoptr (i64 22 to ptr), ptr %obj)
+      br i1 %check, label %hit, label %miss
+    hit:
+      ret void
+    miss:
+      ret void
+    }
+  )");
+  ASSERT_NE(F, nullptr);
+  DominatorTree DT(*F);
+  JavaTypeCache Cache;
+  CachedJavaTypeQueryInfo Info;
+  Instruction *Context = block(*F, "hit")->getTerminator();
+  EXPECT_EQ(getCachedJavaType(F->getArg(0), &DT, Context, nullptr, Cache, Info)
+                .Klass,
+            22U);
+  // A store has no SSA users, but its dereference can affect LVI's null-edge
+  // answers. Contextual entries must be discarded even for another key.
+  Instruction *Store = &F->getEntryBlock().front();
+  auto Invalidated = Cache.invalidate({Store});
+  EXPECT_FALSE(Invalidated.FullClear);
+  EXPECT_GT(Invalidated.FactsRemoved, 0U);
+  EXPECT_EQ(Invalidated.FinalRemoved, 1U);
+  EXPECT_EQ(Cache.baseSize(), 1U);
+  Store->eraseFromParent();
+  EXPECT_EQ(getCachedJavaType(F->getArg(0), &DT, Context, nullptr, Cache, Info)
+                .Klass,
+            22U);
+  EXPECT_EQ(Info.FinalHits, 0U);
+}
+
 } // namespace

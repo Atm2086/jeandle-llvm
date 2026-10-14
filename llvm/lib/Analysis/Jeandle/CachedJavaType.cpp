@@ -68,8 +68,11 @@ JavaTypeCache::invalidate(ArrayRef<Value *> Changed, bool CFGChanged) {
     }
     if (auto *I = dyn_cast<Instruction>(V)) {
       // Calls include assumptions and changes to nullability attributes.
+      // LVI also infers non-null facts from dereferences (loads/stores etc.),
+      // which need not be SSA users of the value whose facts are cached.
       // Terminators can change the CFG and edge predicates used by LVI.
-      DropContext |= I->isTerminator() || isa<CallBase>(I);
+      DropContext |= I->isTerminator() || isa<CallBase>(I) ||
+                     I->mayReadOrWriteMemory();
     }
     for (User *U : V->users()) {
       if (++UsesVisited > MaxInvalidationUses) {
