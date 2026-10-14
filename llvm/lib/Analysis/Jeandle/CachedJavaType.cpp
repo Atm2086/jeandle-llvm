@@ -337,6 +337,8 @@ static JavaType getBaseJavaTypeCase(Value *V,
 /// Frame-level memoizing driver around getBaseJavaTypeCase: one frame per
 /// value; cache on completion when the frame's own sub-computation never hit
 /// a PHI cycle, or unconditionally for the query's root (see BaseMemo).
+/// CycleHit: 本次子计算是否遇到 PHI 环
+/// IsRoot: 当前是不是一次基础类型查询的最外层调用
 static JavaType getBaseJavaTypeRaw(Value *V,
                                    SmallPtrSetImpl<const PHINode *> &Visited,
                                    BaseMemo &Memo, bool &CycleHit,
@@ -344,7 +346,7 @@ static JavaType getBaseJavaTypeRaw(Value *V,
   if (auto It = Memo.find(V); It != Memo.end())
     return It->second;
   JavaType R = getBaseJavaTypeCase(V, Visited, Memo, CycleHit);
-  if (IsRoot || !CycleHit)
+  if (IsRoot || !CycleHit) // 标记是最外层调用
     Memo[V] = R;
   return R;
 }
@@ -352,8 +354,9 @@ static JavaType getBaseJavaTypeRaw(Value *V,
 /// Base-type query root. Pass a Memo to share the completion cache across a
 /// whole query (the engine's value dimension does); without one, a fresh
 /// per-call cache is used (the base-only query path).
-static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr) {
-  SmallPtrSet<const PHINode *, 8> Visited;
+static JavaType getBaseJavaType(Value *V,
+                                SmallPtrSetImpl<const PHINode *> &Visited,
+                                BaseMemo *Memo = nullptr){
   BaseMemo LocalMemo;
   BaseMemo &Cache = Memo ? *Memo : LocalMemo;
   bool CycleHit = false;
@@ -1032,10 +1035,10 @@ struct CachedJavaTypeQueryContext {
   DenseMap<std::pair<Value *, BasicBlock *>, std::optional<JavaType>> Processed;
   DenseMap<std::pair<Value *, BasicBlock *>, JavaType> *PathFacts;
   const DenseMap<std::pair<Value *, BasicBlock *>, JavaType> *FinalTypes;
-  unsigned FactsBudget;
-  unsigned PhiBudget;
+  unsigned FactsBudget; // 路径事实还能放多少个块
+  unsigned PhiBudget;   // phi 环
 
-  // 一旦发生 facts 截断，本次查询不再向共享 PathFacts 发布新结果。
+  // 记录事件：路径事实截断 和 phi环截断
   bool FactsTruncated = false;
   bool PhiTruncated = false;
   // PHI 环跳过不阻止顶层结果缓存，但此时不要求冷热查询严格同精度。
@@ -1182,6 +1185,8 @@ static JavaType factsAt(Value *V, BasicBlock *BB, CachedJavaTypeQueryContext &Q)
   if (!Q.DT.isReachableFromEntry(BB))
     return {}; // Dominance is undefined for unreachable blocks.
 
+  // 缓存版更改
+  // 查询 Processed 之前，先查 PathFacts
   auto Key = std::make_pair(V, BB);
   if (Q.PathFacts) {
     auto It = Q.PathFacts->find(Key);
@@ -1192,6 +1197,8 @@ static JavaType factsAt(Value *V, BasicBlock *BB, CachedJavaTypeQueryContext &Q)
     ++Q.FactsMisses;
   }
   auto [It, Inserted] = Q.Processed.try_emplace(Key);
+
+  // 遇到 CFG 递归环时，新增截断标记
   if (!Inserted) {
     if (It->second)
       return *It->second;
@@ -1199,6 +1206,7 @@ static JavaType factsAt(Value *V, BasicBlock *BB, CachedJavaTypeQueryContext &Q)
     return {}; // On the evaluation stack: a cycle the back-edge rule cannot
                // cut (irreducible) — empty contribution to that join arm.
   }
+  // 预算耗尽，新增标记
   if (Q.FactsBudget == 0) {
     Q.FactsTruncated = true;
     ++NumCachedJavaTypeBudgetExhausted;
@@ -1320,7 +1328,8 @@ static JavaType valueDimension(Value *V, CachedJavaTypeQueryContext &Q) {
   // dimension's stack would let an outer phiValueType frame be mistaken for
   // a cycle, silently dropping a live incoming and caching the too-narrow
   // result.
-  return getBaseJavaType(V, &Q.BaseTypes);
+  SmallPtrSet<const PHINode *, 8> BaseStack;
+  return getBaseJavaType(V, BaseStack, &Q.BaseTypes);
 }
 
 // =============================================================================
@@ -1328,34 +1337,36 @@ static JavaType valueDimension(Value *V, CachedJavaTypeQueryContext &Q) {
 // =============================================================================
 
 JavaType jeandle::getCachedJavaType(Value *V, DominatorTree *DT,
-                                  Instruction *Context,
-                                  IsNullEdgeOracle IsNullEdge,
-                                  JavaTypeCache &Cache,
-                                  CachedJavaTypeQueryInfo &Info) {
-  assert(V && "cannot query the Java type of a null Value");
+                                    Instruction *Context,
+                                    IsNullEdgeOracle IsNullEdge,
+                                    JavaTypeCache &Cache,
+                                    CachedJavaTypeQueryInfo &Info) {
+  
   Info = {};
   V = stripCastsAndFreeze(V);
-  BaseMemo &Memo = Cache.BaseTypes;
+  BaseMemo &Memo = Cache.BaseTypes; // 这里使用 Base
+
   if (!DT || !Context) {
     if (Memo.contains(V))
       ++Info.BaseHits;
     else
       ++Info.BaseMisses;
-    return getBaseJavaType(V, &Memo);
+    SmallPtrSet<const PHINode *, 8> Visited;
+    return getBaseJavaType(V, Visited, &Memo);
   }
 
   auto Key = std::make_pair(V, Context->getParent());
-  auto It = Cache.FinalTypes.find(Key);
+  auto It = Cache.FinalTypes.find(Key); // 这里使用 Final
   if (It != Cache.FinalTypes.end()) {
     ++Info.FinalHits;
     return It->second;
   }
   ++Info.FinalMisses;
 
-  CachedJavaTypeQueryContext Q(*DT, IsNullEdge, Memo, &Cache.PathFacts,
-                              &Cache.FinalTypes);
+  CachedJavaTypeQueryContext Q(*DT, IsNullEdge, Memo, &Cache.PathFacts, &Cache.FinalTypes);
   JavaType T = valueDimension(V, Q);
   JavaType Result = typeIntersect(T, factsAt(V, Context->getParent(), Q));
+
   // Only a completed top-level result may be published. Recursive PHI frames
   // can depend on the outer PHI stack and must not publish their local results.
   if (!Q.FactsTruncated && !Q.PhiTruncated)

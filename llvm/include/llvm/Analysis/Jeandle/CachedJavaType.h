@@ -54,14 +54,23 @@ public:
   size_t finalTypesSize() const { return FinalTypes.size(); }
 };
 
+/// @brief 
 /// Query through the isolated cached engine. Use the original getJavaType in
 /// JavaType.h when caching is disabled or an independent reference is needed.
 /// An empty Cache starts a cold evaluation; Info is reset for every query.
-LLVM_ABI JavaType getCachedJavaType(Value *V, DominatorTree *DT,
-                                   Instruction *Context,
-                                   IsNullEdgeOracle IsNullEdge,
-                                   JavaTypeCache &Cache,
-                                   CachedJavaTypeQueryInfo &Info);
+/// @param V 
+/// @param DT 
+/// @param Context 
+/// @param IsNullEdge 
+/// @param Cache 
+/// @param Info 统计
+/// @return 
+LLVM_ABI JavaType getCachedJavaType(Value *V, 
+                                    DominatorTree *DT,
+                                    Instruction *Context,
+                                    IsNullEdgeOracle IsNullEdge,
+                                    JavaTypeCache &Cache,
+                                    CachedJavaTypeQueryInfo &Info);
 
 } // namespace llvm::jeandle
 

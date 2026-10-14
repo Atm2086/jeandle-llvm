@@ -184,7 +184,7 @@ JavaType JavaTypeAnalysisResult::getJavaType(Value *V, Instruction *Context) {
   Stats.PeakFinalEntries =
       std::max<size_t>(Stats.PeakFinalEntries, Cache.finalTypesSize());
 
-  // 可选重算校验
+  // 可选重算校验，这里好像有点奇怪的问题
   if (VerifyJavaTypeCache && !DisableJavaTypeCache) {
     ++Stats.Verifications;
     ++TotalVerifications;
