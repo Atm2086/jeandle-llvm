@@ -9,6 +9,7 @@
 #ifndef LLVM_ANALYSIS_JEANDLE_CACHEDJAVATYPE_H
 #define LLVM_ANALYSIS_JEANDLE_CACHEDJAVATYPE_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/IR/Jeandle/JavaType.h"
 #include <cstddef>
@@ -30,9 +31,19 @@ struct CachedJavaTypeQueryInfo {
   uint64_t FinalMisses = 0;
 };
 
+/// Work performed by one invalidation. Counts are entries, not bytes.
+struct JavaTypeCacheInvalidationInfo {
+  size_t BaseRemoved = 0;
+  size_t FactsRemoved = 0;
+  size_t FinalRemoved = 0;
+  size_t ValuesVisited = 0;
+  bool FullClear = false;
+};
+
 /// Completed results reusable while IR, type information and query dependencies
 /// remain unchanged. Recursion stacks and budgets stay private to each query.
-/// Call clear() before querying after a relevant change, and update DT/oracle.
+/// Notify mutations before replacing uses or deleting values, and update
+/// DT/oracle before the next query. Unclassified changes still require clear().
 class JavaTypeCache {
   using ContextKey = std::pair<Value *, BasicBlock *>;
   DenseMap<Value *, JavaType> BaseTypes;
@@ -49,6 +60,17 @@ public:
     PathFacts.clear();
     FinalTypes.clear();
   }
+  /// Invalidate Changed and its transitive SSA users before mutation. Changes
+  /// reaching calls or terminators also discard all contextual results, since
+  /// these may affect guards and LVI facts about otherwise unrelated values.
+  /// CFGChanged additionally discards all derived base results; direct leaf
+  /// types survive unless affected by Changed. Every erased value must be
+  /// notified while still live, including values in erased blocks. Structural
+  /// CFG edits must set CFGChanged, even when the changed terminator has no
+  /// SSA users. VM/type-universe changes require clear(). Unsupported roots
+  /// or an oversized use closure fall back to clearing all entries.
+  LLVM_ABI JavaTypeCacheInvalidationInfo
+  invalidate(ArrayRef<Value *> Changed, bool CFGChanged = false);
   size_t baseSize() const { return BaseTypes.size(); }
   size_t pathFactsSize() const { return PathFacts.size(); }
   size_t finalTypesSize() const { return FinalTypes.size(); }

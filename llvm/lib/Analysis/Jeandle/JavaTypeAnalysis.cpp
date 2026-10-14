@@ -42,6 +42,24 @@ cl::opt<bool> VerifyJavaTypeCache(
     cl::Hidden,
     cl::init(false));
 
+cl::opt<bool> ForceFullJavaTypeInvalidation(
+    "jeandle-java-type-force-full-invalidation",
+    cl::desc("Use full clears for Java type mutation notifications (A/B baseline)"),
+    cl::Hidden, cl::init(false));
+
+ALWAYS_ENABLED_STATISTIC(TotalInvalidations, "Java type invalidation requests");
+ALWAYS_ENABLED_STATISTIC(TotalSelectiveInvalidations, "Java type selective invalidations");
+ALWAYS_ENABLED_STATISTIC(TotalCFGInvalidations, "Java type CFG invalidations");
+ALWAYS_ENABLED_STATISTIC(TotalInvalidationVisits, "Java type invalidation values visited");
+ALWAYS_ENABLED_STATISTIC(TotalBaseRemoved, "Java type base entries invalidated");
+ALWAYS_ENABLED_STATISTIC(TotalFactsRemoved, "Java type path facts entries invalidated");
+ALWAYS_ENABLED_STATISTIC(TotalFinalRemoved, "Java type final type entries invalidated");
+ALWAYS_ENABLED_STATISTIC(TotalBaseRetained, "Java type base entries retained");
+ALWAYS_ENABLED_STATISTIC(TotalFactsRetained, "Java type path facts entries retained");
+ALWAYS_ENABLED_STATISTIC(TotalFinalRetained, "Java type final type entries retained");
+ALWAYS_ENABLED_STATISTIC(TotalInvalidationTimeNanoseconds, "Java type total invalidation time (ns)");
+ALWAYS_ENABLED_STATISTIC(TotalQueryTimeNanoseconds, "Java type total query time (ns)");
+
 ALWAYS_ENABLED_STATISTIC(TotalQueries,
                         "Java type analysis queries");
 ALWAYS_ENABLED_STATISTIC(TotalFactsHits,
@@ -204,25 +222,78 @@ JavaType JavaTypeAnalysisResult::getJavaType(Value *V, Instruction *Context) {
       reportVerificationFailure(F, V, ContextBB, Result, Fresh);
   }
 
-  Stats.TotalQueryTimeNanoseconds += elapsedNanoseconds(Start);
+  uint64_t Elapsed = elapsedNanoseconds(Start);
+  Stats.TotalQueryTimeNanoseconds += Elapsed;
+  TotalQueryTimeNanoseconds += Elapsed;
   return Result;
 }
 
 /// 粗粒度失效：清空基础类型、路径事实及最终类型缓存，保留累计统计。
 /// pass 内发生相关 IR 修改后，必须在下一次查询前调用；DT/LVI 由调用方维护。
 void JavaTypeAnalysisResult::clear() {
-  Cache.clear();
-  ++Stats.Clears;
-  ++TotalClears;
+  invalidateImpl({}, false, true);
 }
 
-/// 接收值或指令变化的失效通知；预留细粒度入口，目前直接调用 clear。
-/// Changed 在调用时须仍然存活，它也可以是影响查询的分支条件而非缓存键。
+/// Invalidate the old use closure before RAUW/deletion, including non-key
+/// conditions. Caller maintains DT/LVI before the next query.
 void JavaTypeAnalysisResult::invalidate(Value &Changed) {
-  // TODO：记录值、分支条件和 CFG 的反向依赖，再实现选择性清除。
-  // 仅监听缓存键的删除无法覆盖条件变化，当前统一回退为粗粒度失效。
-  (void)Changed;
-  clear();
+  Value *V = &Changed;
+  invalidate({V});
+}
+
+void JavaTypeAnalysisResult::invalidate(ArrayRef<Value *> Changed,
+                                        bool CFGChanged) {
+  invalidateImpl(Changed, CFGChanged, ForceFullJavaTypeInvalidation);
+}
+
+void JavaTypeAnalysisResult::invalidateForCFGChange(Value &Changed) {
+  Value *V = &Changed;
+  invalidate({V}, true);
+}
+
+void JavaTypeAnalysisResult::invalidateImpl(ArrayRef<Value *> Changed,
+                                            bool CFGChanged, bool ForceFull) {
+  auto Start = QueryClock::now();
+  ++Stats.Invalidations;
+  ++TotalInvalidations;
+  if (CFGChanged) {
+    ++Stats.CFGInvalidations;
+    ++TotalCFGInvalidations;
+  }
+  JavaTypeCacheInvalidationInfo Info;
+  if (ForceFull) {
+    Info.BaseRemoved = Cache.baseSize();
+    Info.FactsRemoved = Cache.pathFactsSize();
+    Info.FinalRemoved = Cache.finalTypesSize();
+    Info.FullClear = true;
+    Cache.clear();
+  } else {
+    Info = Cache.invalidate(Changed, CFGChanged);
+  }
+  if (Info.FullClear) {
+    ++Stats.Clears;
+    ++TotalClears;
+  } else {
+    ++Stats.SelectiveInvalidations;
+    ++TotalSelectiveInvalidations;
+  }
+  Stats.InvalidationVisits += Info.ValuesVisited;
+  TotalInvalidationVisits += Info.ValuesVisited;
+  Stats.BaseRemoved += Info.BaseRemoved;
+  TotalBaseRemoved += Info.BaseRemoved;
+  Stats.FactsRemoved += Info.FactsRemoved;
+  TotalFactsRemoved += Info.FactsRemoved;
+  Stats.FinalRemoved += Info.FinalRemoved;
+  TotalFinalRemoved += Info.FinalRemoved;
+  Stats.BaseRetained += Cache.baseSize();
+  TotalBaseRetained += Cache.baseSize();
+  Stats.FactsRetained += Cache.pathFactsSize();
+  TotalFactsRetained += Cache.pathFactsSize();
+  Stats.FinalRetained += Cache.finalTypesSize();
+  TotalFinalRetained += Cache.finalTypesSize();
+  uint64_t Elapsed = elapsedNanoseconds(Start);
+  Stats.InvalidationTimeNanoseconds += Elapsed;
+  TotalInvalidationTimeNanoseconds += Elapsed;
 }
 
 /// 供 FunctionAnalysisManager 判断本分析是否失效，返回 true 表示应丢弃结果。
@@ -266,6 +337,17 @@ void JavaTypeAnalysisResult::print(raw_ostream &OS) const {
   OS << "  current final type entries: " << Cache.finalTypesSize() << '\n';
   OS << "  peak final type entries: " << Stats.PeakFinalEntries << '\n';
   OS << "  clears: " << Stats.Clears << '\n';
+  OS << "  invalidation requests: " << Stats.Invalidations << '\n';
+  OS << "  selective invalidations: " << Stats.SelectiveInvalidations << '\n';
+  OS << "  CFG invalidations: " << Stats.CFGInvalidations << '\n';
+  OS << "  invalidation values visited: " << Stats.InvalidationVisits << '\n';
+  OS << "  base entries invalidated: " << Stats.BaseRemoved << '\n';
+  OS << "  path facts entries invalidated: " << Stats.FactsRemoved << '\n';
+  OS << "  final type entries invalidated: " << Stats.FinalRemoved << '\n';
+  OS << "  base entries retained: " << Stats.BaseRetained << '\n';
+  OS << "  path facts entries retained: " << Stats.FactsRetained << '\n';
+  OS << "  final type entries retained: " << Stats.FinalRetained << '\n';
+  OS << "  total invalidation time (ns): " << Stats.InvalidationTimeNanoseconds << '\n';
   OS << "  bypasses: " << Stats.Bypasses << '\n';
   OS << "  verifications: " << Stats.Verifications << '\n';
   OS << "  verification skips: " << Stats.VerificationSkips << '\n';
@@ -305,6 +387,18 @@ PreservedAnalyses JavaTypeAnalysisSummaryPrinterPass::run( Module &M,
   OS << "  base-only query misses: " << TotalBaseMisses.getValue() << '\n';
   OS << "  base insertions: " << TotalBaseInsertions.getValue() << '\n';
   OS << "  clears: " << TotalClears.getValue() << '\n';
+  OS << "  invalidation requests: " << TotalInvalidations.getValue() << '\n';
+  OS << "  selective invalidations: " << TotalSelectiveInvalidations.getValue() << '\n';
+  OS << "  CFG invalidations: " << TotalCFGInvalidations.getValue() << '\n';
+  OS << "  invalidation values visited: " << TotalInvalidationVisits.getValue() << '\n';
+  OS << "  base entries invalidated: " << TotalBaseRemoved.getValue() << '\n';
+  OS << "  path facts entries invalidated: " << TotalFactsRemoved.getValue() << '\n';
+  OS << "  final type entries invalidated: " << TotalFinalRemoved.getValue() << '\n';
+  OS << "  base entries retained: " << TotalBaseRetained.getValue() << '\n';
+  OS << "  path facts entries retained: " << TotalFactsRetained.getValue() << '\n';
+  OS << "  final type entries retained: " << TotalFinalRetained.getValue() << '\n';
+  OS << "  total invalidation time (ns): " << TotalInvalidationTimeNanoseconds.getValue() << '\n';
+  OS << "  total query time (ns): " << TotalQueryTimeNanoseconds.getValue() << '\n';
   OS << "  bypasses: " << TotalBypasses.getValue() << '\n';
   OS << "  verifications: " << TotalVerifications.getValue() << '\n';
   OS << "  verification skips: " << TotalVerificationSkips.getValue() << '\n';

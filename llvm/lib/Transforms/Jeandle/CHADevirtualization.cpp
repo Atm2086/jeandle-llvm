@@ -105,8 +105,8 @@ Value *tryNarrowJavaObjType(Value *Receiver, JavaType HolderType,
   }
   if (CastedReceiverType != ReceiverType) {
     Value *Assume = insertJavaTypeAssume(Receiver, CastedReceiverType, &CB);
-    // 后续参数还会继续查询类型，插入新指令后先清理共享结果。
-    JavaTypes.clear();
+    // The new value has no old users; keep independent base computations.
+    JavaTypes.invalidate(*Assume);
     return Assume;
   }
   return Receiver;
@@ -332,6 +332,7 @@ InvokeInst *optimizeMhIntrinsic(InvokeInst &CB, Function &F, DominatorTree &DT,
                                 CHAOptInfo.Method)) {
     for (auto &[_, Value] : JavaTypeAssumeCB) {
       if (CallInst *Inst = dyn_cast_or_null<CallInst>(Value)) {
+        JavaTypes.invalidate(*Inst);
         Inst->eraseFromParent();
       }
     }
@@ -339,10 +340,13 @@ InvokeInst *optimizeMhIntrinsic(InvokeInst &CB, Function &F, DominatorTree &DT,
   }
 
   // Commit the narrowed operands only after validation.
+  StringRef NewBCName = getByteCodeName(IntrinsicName);
+  // A static linkTo* replacement keeps the CFG and the base expression graph.
+  // Receiver-bearing calls additionally insert a null-check split below.
+  JavaTypes.invalidate({&CB}, /*CFGChanged=*/hasReceiver(NewBCName));
   for (auto &[ArgIdx, AssumeCB] : JavaTypeAssumeCB) {
     CB.setArgOperand(ArgIdx, AssumeCB);
   }
-  StringRef NewBCName = getByteCodeName(IntrinsicName);
 
   // linkTo* performs the receiver null check implicitly. Preserve that
   // behavior before replacing it with a direct Java invoke.
@@ -456,6 +460,8 @@ bool optimizeCallSite(InvokeInst &CB, Function &F, DominatorTree &DT,
     StringRef IntrinsicName =
         CB.getFnAttr(jeandle::Attribute::MhIntrinsicName).getValueAsString();
     if (IntrinsicName == "_invokeBasic") {
+      // The old invoke and its uses must be live when invalidating.
+      JavaTypes.invalidate(CB);
       InvokeInst *NewCB = optimizeInvokeBasic(CB, Callbacks, Caller);
       if (!NewCB)
         return false;
@@ -468,13 +474,12 @@ bool optimizeCallSite(InvokeInst &CB, Function &F, DominatorTree &DT,
           CB, F, DT, DTU, JavaTypes, Callbacks, Caller, IntrinsicName);
       // helper 可能在失败返回前修改 IR；下一次查询前统一更新依赖。
       DTU.flush();
-      JavaTypes.clear();
       LVI.clear();
       if (NewCB) {
+        JavaTypes.invalidate(CB);
         CB.replaceAllUsesWith(NewCB);
         CB.eraseFromParent();
         // RAUW 后再次清理 LVI，避免递归查询新 invoke 时使用旧状态。
-        JavaTypes.clear();
         LVI.clear();
         optimizeCallSite(*NewCB, F, DT, DTU, JavaTypes, LVI, Callbacks,
                          Caller);
@@ -540,6 +545,7 @@ bool optimizeCallSite(InvokeInst &CB, Function &F, DominatorTree &DT,
   if (!PreCallDeopt)
     return false;
 
+  JavaTypes.invalidateForCFGChange(CB);
   BasicBlock *CheckInstanceofFail =
       insertCheckInstanceOf(CB, Receiver, OptInfo.constraint(), Prefix, &DTU);
   assert(CheckInstanceofFail && "failed to insert check_instanceof");
@@ -606,7 +612,6 @@ PreservedAnalyses CHADevirtualization::run(Function &F,
     Changed |= Rewritten;
     if (Rewritten) {
       DTU.flush();
-      JavaTypes.clear();
       LVI.clear();
     }
   }
@@ -616,5 +621,7 @@ PreservedAnalyses CHADevirtualization::run(Function &F,
 
   PreservedAnalyses PA;
   PA.preserve<DominatorTreeAnalysis>();
+  PA.preserve<LazyValueAnalysis>();
+  PA.preserve<jeandle::JavaTypeAnalysis>();
   return PA;
 }

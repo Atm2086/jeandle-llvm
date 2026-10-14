@@ -17,6 +17,7 @@
 
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
 #include "llvm/Analysis/Jeandle/JavaTypeAnalysis.h"
+#include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
@@ -165,6 +166,13 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
   }
 
   // --- Apply all folds ---
+  // Capture old uses before RAUW erases the dependency on each check. Batch
+  // notifications so shared users are traversed only once.
+  SmallVector<Value *, 16> ChangedChecks;
+  for (const FoldDecision &Fold : Folds)
+    ChangedChecks.push_back(Fold.Check);
+  if (!ChangedChecks.empty())
+    JavaTypes.invalidate(ChangedChecks);
   bool Changed = false;
   for (const FoldDecision &F : Folds)
     Changed |= foldCheckToConstant(F.Check, F.Result);
@@ -172,11 +180,13 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
   if (!Changed)
     return PreservedAnalyses::all();
 
-  // 所有查询都在修改前完成；批量折叠后清理基础类型及路径事实缓存。
-  JavaTypes.clear();
+  // Branch predicates may have changed even though CFG edges did not.
+  FAM.getResult<LazyValueAnalysis>(F).clear();
 
   PreservedAnalyses PA;
   PA.preserveSet<CFGAnalyses>();
   PA.preserve<DominatorTreeAnalysis>();
+  PA.preserve<LazyValueAnalysis>();
+  PA.preserve<jeandle::JavaTypeAnalysis>();
   return PA;
 }

@@ -32,16 +32,18 @@ namespace jeandle {
 /// 单个 Function 的分析结果，供优化 Pass 查询 JavaType 并管理缓存失效。
 /// 持有 BaseTypes、PathFacts 和 FinalTypes，跨查询复用基础类型、路径事实及最终类型；
 /// 递归栈和预算仍属于单次查询，DT/LVI 由分析管理器提供，本类只持有引用。
-/// IR 或依赖的类型信息变化后，必须在下次查询前 clear，并更新 DT/LVI。
+/// IR 修改前通知受影响的值；下一次查询前必须更新 DT/LVI。
 class JavaTypeAnalysisResult {
 public:
 
   LLVM_ABI JavaType getJavaType(Value *V,
                                 Instruction *Context = nullptr);
   LLVM_ABI void clear();
-  // 预留细粒度失效通知；尚未实现依赖追踪，当前安全回退为全量清空。
-  // Changed 在通知时必须仍然存活；分支条件等非缓存键的修改也需要通知。
+  // Notify before RAUW/deletion so the old use graph can still be traversed.
+  // Unknown changes and changes to VM type information require clear().
   LLVM_ABI void invalidate(Value &Changed);
+  LLVM_ABI void invalidate(ArrayRef<Value *> Changed, bool CFGChanged = false);
+  LLVM_ABI void invalidateForCFGChange(Value &Changed);
   LLVM_ABI void print(raw_ostream &OS) const;
 
   // llvm 分析管理器的失效回调
@@ -61,6 +63,9 @@ private:
 
   JavaTypeCache Cache;
 
+  void invalidateImpl(ArrayRef<Value *> Changed, bool CFGChanged,
+                      bool ForceFull);
+
   /// 当前 Result 的累计查询、缓存和校验统计；clear 只清缓存，不重置这些计数。
   /// BaseHits/BaseMisses 仅统计无上下文查询，FactsHits/FactsMisses 统计共享路径事实查找。
   /// FinalHits/FinalMisses 同时统计顶层与 PHI incoming 的最终缓存查找。
@@ -75,6 +80,18 @@ private:
     uint64_t BaseInsertions = 0;
     uint64_t Bypasses = 0;
     uint64_t Clears = 0;
+    uint64_t Invalidations = 0;
+    uint64_t SelectiveInvalidations = 0;
+    uint64_t CFGInvalidations = 0;
+    uint64_t InvalidationVisits = 0;
+    uint64_t BaseRemoved = 0;
+    uint64_t FactsRemoved = 0;
+    uint64_t FinalRemoved = 0;
+    // Sums over invalidation events, not counts of distinct retained entries.
+    uint64_t BaseRetained = 0;
+    uint64_t FactsRetained = 0;
+    uint64_t FinalRetained = 0;
+    uint64_t InvalidationTimeNanoseconds = 0;
     uint64_t Verifications = 0;
     uint64_t VerificationSkips = 0;
     uint64_t TotalQueryTimeNanoseconds = 0;

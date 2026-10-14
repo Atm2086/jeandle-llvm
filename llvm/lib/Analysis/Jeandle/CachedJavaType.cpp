@@ -12,10 +12,13 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/Attributes.h"
@@ -34,6 +37,87 @@ using namespace llvm::jeandle;
 
 STATISTIC(NumCachedJavaTypeBudgetExhausted,
           "Number of edge-facts queries that hit the per-query join budget");
+
+JavaTypeCacheInvalidationInfo
+JavaTypeCache::invalidate(ArrayRef<Value *> Changed, bool CFGChanged) {
+  JavaTypeCacheInvalidationInfo Info;
+  const size_t OldBase = BaseTypes.size();
+  const size_t OldFacts = PathFacts.size();
+  const size_t OldFinal = FinalTypes.size();
+  if (OldBase + OldFacts + OldFinal == 0)
+    return Info;
+
+  // Traverse the old use graph, rather than adding reverse dependency edges
+  // to every query. This includes non-key values such as a guard condition.
+  // Bound invalidation work and retain clear() as the conservative fallback.
+  constexpr unsigned MaxInvalidationValues = 4096;
+  constexpr unsigned MaxInvalidationUses = 4 * MaxInvalidationValues;
+  unsigned UsesVisited = 0;
+  SmallPtrSet<Value *, 32> Affected;
+  SmallVector<Value *, 32> Worklist(Changed.begin(), Changed.end());
+  bool DropContext = CFGChanged;
+  while (!Worklist.empty()) {
+    Value *V = Worklist.pop_back_val();
+    if (!V || !Affected.insert(V).second)
+      continue;
+    ++Info.ValuesVisited;
+    if (Info.ValuesVisited > MaxInvalidationValues ||
+        (!isa<Instruction>(V) && !isa<Argument>(V))) {
+      Info.FullClear = true;
+      break;
+    }
+    if (auto *I = dyn_cast<Instruction>(V)) {
+      // Calls include assumptions and changes to nullability attributes.
+      // Terminators can change the CFG and edge predicates used by LVI.
+      DropContext |= I->isTerminator() || isa<CallBase>(I);
+    }
+    for (User *U : V->users()) {
+      if (++UsesVisited > MaxInvalidationUses) {
+        Info.FullClear = true;
+        break;
+      }
+      Worklist.push_back(U);
+    }
+    if (Info.FullClear)
+      break;
+  }
+
+  auto EraseMatching = [](auto &Map, auto Predicate) {
+    for (auto It = Map.begin(), End = Map.end(); It != End;) {
+      auto Current = It++;
+      if (Predicate(*Current))
+        Map.erase(Current);
+    }
+  };
+  if (Info.FullClear) {
+    clear();
+  } else {
+    EraseMatching(BaseTypes, [&](const auto &Entry) {
+      if (Affected.contains(Entry.first))
+        return true;
+      // PHI membership can change without a changed SSA operand being a
+      // user of the rewritten terminator. Retain only direct, context-free
+      // leaf computations across a structural CFG edit.
+      return CFGChanged &&
+             !isa<Argument, CallBase, LoadInst, Constant>(Entry.first);
+    });
+    if (DropContext) {
+      PathFacts.clear();
+      FinalTypes.clear();
+    } else {
+      EraseMatching(PathFacts, [&](const auto &Entry) {
+        return Affected.contains(Entry.first.first);
+      });
+      EraseMatching(FinalTypes, [&](const auto &Entry) {
+        return Affected.contains(Entry.first.first);
+      });
+    }
+  }
+  Info.BaseRemoved = OldBase - BaseTypes.size();
+  Info.FactsRemoved = OldFacts - PathFacts.size();
+  Info.FinalRemoved = OldFinal - FinalTypes.size();
+  return Info;
+}
 
 // =============================================================================
 // Helpers
