@@ -49,6 +49,7 @@
 #include "llvm/Analysis/InlineAdvisor.h"
 #include "llvm/Analysis/InstCount.h"
 #include "llvm/Analysis/Jeandle/JavaTypeAnalysis.h"
+#include "llvm/Analysis/Jeandle/JavaTypeAnalysisStats.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/Analysis/KernelInfo.h"
 #include "llvm/Analysis/LastRunTrackingAnalysis.h"

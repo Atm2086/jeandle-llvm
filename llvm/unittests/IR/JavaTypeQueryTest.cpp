@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/Jeandle/JavaTypeAnalysis.h"
+#include "llvm/Analysis/Jeandle/JavaTypeAnalysisStats.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Dominators.h"
@@ -44,6 +45,7 @@ class JavaTypeQueryTest : public testing::Test {
 protected:
   LLVMContext C;
   std::unique_ptr<Module> M;
+  std::unique_ptr<ScopedQueryOption<bool>> StatisticsFlag;
   VMCallbacks Saved{};
 
   void SetUp() override {
@@ -58,9 +60,16 @@ protected:
       return A == B ? A : uintptr_t(1);
     };
     registerVMCallbacks(CB);
+    // Statistics are off by default; these tests observe counters and cache
+    // sizes, so enable them explicitly.
+    StatisticsFlag = std::make_unique<ScopedQueryOption<bool>>(
+        "jeandle-java-type-stats", true);
   }
 
-  void TearDown() override { registerVMCallbacks(Saved); }
+  void TearDown() override {
+    StatisticsFlag.reset();
+    registerVMCallbacks(Saved);
+  }
 
   Function *parse(StringRef IR) {
     SMDiagnostic Error;
@@ -75,10 +84,12 @@ protected:
     return nullptr;
   }
 
-  std::string statistics(const JavaTypeAnalysisResult &Result) {
+  // Statistics were split out of the analysis result; queries and invalidations
+  // are reported to the statistics analysis through the observer.
+  std::string statistics(FunctionAnalysisManager &FAM, Function *F) {
     std::string Text;
     raw_string_ostream OS(Text);
-    Result.print(OS);
+    FAM.getResult<JavaTypeStatsAnalysis>(*F).print(OS);
     return Text;
   }
 
@@ -231,7 +242,7 @@ TEST_F(JavaTypeQueryTest, IrreducibleCycleStaysLocal) {
   PB.registerFunctionAnalyses(FAM);
   auto &Result = FAM.getResult<JavaTypeAnalysis>(*F);
   EXPECT_TRUE(Result.getJavaType(V, block(*F, "a")->getTerminator()).isUnknown());
-  EXPECT_NE(statistics(Result).find("current final type entries: 0"),
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 0"),
             std::string::npos);
 }
 
@@ -252,7 +263,7 @@ TEST_F(JavaTypeQueryTest, ResultInvalidationAfterConditionAndAttributeChange) {
   auto *Branch = cast<BranchInst>(block(*F, "guard")->getTerminator());
   Branch->setCondition(F->getArg(1));
   Result.invalidate(*Branch);
-  EXPECT_NE(statistics(Result).find("current final type entries: 0"),
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 0"),
             std::string::npos);
   FAM.getResult<LazyValueAnalysis>(*F).clear();
   EXPECT_TRUE(Result.getJavaType(V, Context).isUnknown());
@@ -276,15 +287,15 @@ TEST_F(JavaTypeQueryTest, FinalTypesAreKeyedByContextBlock) {
   EXPECT_TRUE(Result.getJavaType(V, &Guard->front()).isUnknown());
   EXPECT_TRUE(Result.getJavaType(V, Guard->getTerminator()).isUnknown());
   EXPECT_EQ(Result.getJavaType(V, block(*F, "hit")->getTerminator()).Klass, 22U);
-  EXPECT_NE(statistics(Result).find("final type hits: 1"), std::string::npos);
-  EXPECT_NE(statistics(Result).find("current final type entries: 2"),
+  EXPECT_NE(statistics(FAM, F).find("final type hits: 1"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 2"),
             std::string::npos);
   Result.clear();
-  EXPECT_NE(statistics(Result).find("current final type entries: 0"),
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 0"),
             std::string::npos);
-  EXPECT_NE(statistics(Result).find("current path facts entries: 0"),
+  EXPECT_NE(statistics(FAM, F).find("current path facts entries: 0"),
             std::string::npos);
-  EXPECT_NE(statistics(Result).find("current base entries: 0"),
+  EXPECT_NE(statistics(FAM, F).find("current base entries: 0"),
             std::string::npos);
 }
 
@@ -312,10 +323,10 @@ TEST_F(JavaTypeQueryTest, RecursiveFinalHitStillAppliesIncomingGuard) {
             1U);
   BasicBlock *Hit = block(*F, "hit");
   EXPECT_EQ(Result.getJavaType(&Hit->front(), Hit->getTerminator()).Klass, 22U);
-  EXPECT_NE(statistics(Result).find("final type hits: 1"), std::string::npos);
-  EXPECT_NE(statistics(Result).find("current final type entries: 2"),
+  EXPECT_NE(statistics(FAM, F).find("final type hits: 1"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 2"),
             std::string::npos);
-  EXPECT_NE(statistics(Result).find("verification skips: 0"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("verification skips: 0"), std::string::npos);
 }
 
 TEST_F(JavaTypeQueryTest, RecursiveFinalHitSavesPhiBudgetAndIsReadOnly) {
@@ -381,15 +392,15 @@ TEST_F(JavaTypeQueryTest, PhiCycleIntermediateIsNotPublished) {
   Instruction *Context = block(*F, "latch")->getTerminator();
   // 查询 a 时内部 b 的局部贡献是 Dog，但只能发布 a 的完整 Animal 结果。
   EXPECT_EQ(Result.getJavaType(A, Context).Klass, 1U);
-  EXPECT_NE(statistics(Result).find("current final type entries: 1"),
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
             std::string::npos);
   // 独立查询 b 时可读取 a 的完整缓存，不能返回之前递归中的局部 Dog。
   EXPECT_EQ(Result.getJavaType(B, Context).Klass, 1U);
-  EXPECT_NE(statistics(Result).find("final type hits: 1"), std::string::npos);
-  EXPECT_NE(statistics(Result).find("current final type entries: 2"),
+  EXPECT_NE(statistics(FAM, F).find("final type hits: 1"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 2"),
             std::string::npos);
   EXPECT_EQ(Result.getJavaType(B, Context).Klass, 1U);
-  EXPECT_NE(statistics(Result).find("verification skips: 3"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("verification skips: 3"), std::string::npos);
 }
 
 TEST_F(JavaTypeQueryTest, CompletePhiCacheCanImproveCyclePrecision) {
@@ -426,7 +437,7 @@ TEST_F(JavaTypeQueryTest, CompletePhiCacheCanImproveCyclePrecision) {
   // 完整 b 缓存是 Animal，可被回边的 Cat guard 收窄，a 得到更精确的 Cat。
   EXPECT_EQ(Result.getJavaType(A, Context).Klass, 22U);
   EXPECT_EQ(Result.getJavaType(A, Context).Klass, 22U);
-  EXPECT_NE(statistics(Result).find("verification skips: 4"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("verification skips: 4"), std::string::npos);
 }
 
 TEST_F(JavaTypeQueryTest, FactsBudgetCutDoesNotPublishFinalType) {
@@ -441,11 +452,11 @@ TEST_F(JavaTypeQueryTest, FactsBudgetCutDoesNotPublishFinalType) {
   {
     ScopedQueryOption<unsigned> Budget("jeandle-max-facts-join-blocks", 1);
     EXPECT_TRUE(Result.getJavaType(V, Context).isUnknown());
-    EXPECT_NE(statistics(Result).find("current final type entries: 0"),
+    EXPECT_NE(statistics(FAM, F).find("current final type entries: 0"),
               std::string::npos);
   }
   EXPECT_EQ(Result.getJavaType(V, Context).Klass, 22U);
-  EXPECT_NE(statistics(Result).find("current final type entries: 1"),
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
             std::string::npos);
 }
 
@@ -468,11 +479,11 @@ TEST_F(JavaTypeQueryTest, PhiBudgetCutDoesNotPublishFinalType) {
   {
     ScopedQueryOption<unsigned> Budget("jeandle-max-facts-join-blocks", 0);
     EXPECT_TRUE(Result.getJavaType(&Merge->front(), Merge->getTerminator()).isUnknown());
-    EXPECT_NE(statistics(Result).find("current final type entries: 0"),
+    EXPECT_NE(statistics(FAM, F).find("current final type entries: 0"),
               std::string::npos);
   }
   EXPECT_EQ(Result.getJavaType(&Merge->front(), Merge->getTerminator()).Klass, 22U);
-  EXPECT_NE(statistics(Result).find("current final type entries: 1"),
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
             std::string::npos);
 }
 
@@ -491,8 +502,8 @@ TEST_F(JavaTypeQueryTest, DisabledCacheBypassesFinalTypes) {
     EXPECT_EQ(Result.getJavaType(V, Context).Klass, 22U);
     EXPECT_EQ(Result.getJavaType(V, block(*F, "tail")->getTerminator()).Klass, 22U);
   }
-  EXPECT_NE(statistics(Result).find("final type hits: 0"), std::string::npos);
-  EXPECT_NE(statistics(Result).find("current final type entries: 1"),
+  EXPECT_NE(statistics(FAM, F).find("final type hits: 0"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
             std::string::npos);
 }
 
@@ -521,8 +532,8 @@ TEST_F(JavaTypeQueryTest, DisabledCacheUsesOriginalAfterAttributeChange) {
               jeandle::getJavaType(V, nullptr, Context, nullptr));
     EXPECT_EQ(Result.getJavaType(V).Klass, 33U);
   }
-  EXPECT_NE(statistics(Result).find("final type hits: 0"), std::string::npos);
-  EXPECT_NE(statistics(Result).find("current final type entries: 1"),
+  EXPECT_NE(statistics(FAM, F).find("final type hits: 0"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
             std::string::npos);
   Result.clear();
   EXPECT_EQ(Result.getJavaType(V, Context).Klass, 33U);
@@ -670,7 +681,7 @@ TEST_F(JavaTypeQueryTest, GuardOperandChangeInvalidatesNonKeyDependencies) {
                              PointerType::get(C, 0)));
   FAM.getResult<LazyValueAnalysis>(*F).clear();
   EXPECT_EQ(Result.getJavaType(V, Context).Klass, 33U);
-  EXPECT_NE(statistics(Result).find("base entries retained: 1"),
+  EXPECT_NE(statistics(FAM, F).find("base entries retained: 1"),
             std::string::npos);
 }
 
@@ -685,12 +696,12 @@ TEST_F(JavaTypeQueryTest, FullInvalidationSwitchDropsAllEntries) {
   EXPECT_EQ(Result.getJavaType(F->getArg(0),
                               block(*F, "tail")->getTerminator()).Klass, 22U);
   Result.invalidate(*block(*F, "guard")->getTerminator());
-  EXPECT_NE(statistics(Result).find("current base entries: 0"), std::string::npos);
-  EXPECT_NE(statistics(Result).find("current path facts entries: 0"),
+  EXPECT_NE(statistics(FAM, F).find("current base entries: 0"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("current path facts entries: 0"),
             std::string::npos);
-  EXPECT_NE(statistics(Result).find("current final type entries: 0"),
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 0"),
             std::string::npos);
-  EXPECT_NE(statistics(Result).find("clears: 1"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("clears: 1"), std::string::npos);
 }
 
 TEST_F(JavaTypeQueryTest, UnsupportedInvalidationFallsBackToClear) {
@@ -783,6 +794,26 @@ TEST_F(JavaTypeQueryTest, DereferenceChangeDropsContextualResults) {
                 .Klass,
             22U);
   EXPECT_EQ(Info.FinalHits, 0U);
+}
+
+TEST_F(JavaTypeQueryTest, StatisticsAreOptIn) {
+  // With the switch off the analysis creates no observer: neither queries nor
+  // invalidations are counted, and no clock is read.
+  ScopedQueryOption<bool> Off("jeandle-java-type-stats", false);
+  Function *F = parse(IR);
+  ASSERT_NE(F, nullptr);
+  FunctionAnalysisManager FAM;
+  PassBuilder PB;
+  PB.registerFunctionAnalyses(FAM);
+  auto &Result = FAM.getResult<JavaTypeAnalysis>(*F);
+  Instruction *Context = block(*F, "tail")->getTerminator();
+  EXPECT_EQ(Result.getJavaType(F->getArg(0), Context).Klass, 22U);
+  Result.invalidate(*block(*F, "guard")->getTerminator());
+  std::string Text = statistics(FAM, F);
+  for (StringRef Zero : {"queries: 0", "current base entries: 0",
+                         "invalidation requests: 0", "clears: 0",
+                         "total query time (ns): 0"})
+    EXPECT_NE(Text.find(Zero.str()), std::string::npos) << Text;
 }
 
 } // namespace

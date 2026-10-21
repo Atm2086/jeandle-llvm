@@ -1,6 +1,6 @@
-; RUN: opt -disable-output -verify-each -passes='function(type-check-elimination,cha-devirtualization),print<java-type-analysis-summary>' -jeandle-vm-callback-log=%S/Inputs/selective-invalidation.cblog %s 2>&1 | FileCheck %s --check-prefix=SELECTIVE
-; RUN: opt -disable-output -verify-each -jeandle-java-type-force-full-invalidation -passes='function(type-check-elimination,cha-devirtualization),print<java-type-analysis-summary>' -jeandle-vm-callback-log=%S/Inputs/selective-invalidation.cblog %s 2>&1 | FileCheck %s --check-prefix=FULL
-; RUN: opt -S -verify-each -jeandle-verify-java-type-cache -passes='function(type-check-elimination,cha-devirtualization),print<java-type-analysis-summary>' -jeandle-vm-callback-log=%S/Inputs/selective-invalidation.cblog %s 2>&1 | FileCheck %s --check-prefix=VERIFY
+; RUN: opt -disable-output -verify-each -jeandle-java-type-stats -passes='function(type-check-elimination,cha-devirtualization),print<java-type-analysis-summary>' -jeandle-vm-callback-log=%S/Inputs/selective-invalidation.cblog %s 2>&1 | FileCheck %s --check-prefix=SELECTIVE
+; RUN: opt -disable-output -verify-each -jeandle-java-type-force-full-invalidation -jeandle-java-type-stats -passes='function(type-check-elimination,cha-devirtualization),print<java-type-analysis-summary>' -jeandle-vm-callback-log=%S/Inputs/selective-invalidation.cblog %s 2>&1 | FileCheck %s --check-prefix=FULL
+; RUN: opt -S -verify-each -jeandle-verify-java-type-cache -jeandle-java-type-stats -passes='function(type-check-elimination,cha-devirtualization),print<java-type-analysis-summary>' -jeandle-vm-callback-log=%S/Inputs/selective-invalidation.cblog %s 2>&1 | FileCheck %s --check-prefix=VERIFY
 ;
 ; TCE folds the check, then CHA resolves two static MethodHandle calls using
 ; the same select DAG. Only the old calls and their users change; the four

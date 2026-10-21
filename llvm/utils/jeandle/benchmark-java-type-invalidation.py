@@ -181,7 +181,11 @@ def main():
     (out / 'reproduce.py').write_bytes(Path(__file__).read_bytes())
     if args.regress:
         regress(root, args.opt, out / 'regression')
-    modes = {'selective': (args.opt, []), 'full': (args.opt, ['-jeandle-java-type-force-full-invalidation'])}
+    # Statistics are off by default; the main binary enables them to emit counters,
+    # while the baseline binary may predate the switch.
+    stats = ['-jeandle-java-type-stats']
+    modes = {'selective': (args.opt, [*stats]),
+             'full': (args.opt, [*stats, '-jeandle-java-type-force-full-invalidation'])}
     if args.baseline_opt:
         modes['baseline'] = (args.baseline_opt, [])
     rng = random.Random(20261014)
@@ -192,7 +196,8 @@ def main():
         ir, cb, passes = generate(dest, kind, args.functions, args.sites, depth)
         common = [f'-passes=function({passes}),print<java-type-analysis-summary>', f'-jeandle-vm-callback-log={cb}', str(ir)]
         outputs = {}
-        checks = dict(modes, original=(args.opt, ['-jeandle-disable-java-type-cache']), verify=(args.opt, ['-jeandle-verify-java-type-cache']))
+        checks = dict(modes, original=(args.opt, [*stats, '-jeandle-disable-java-type-cache']),
+                      verify=(args.opt, [*stats, '-jeandle-verify-java-type-cache']))
         correctness = {}
         for mode, (binary, flags) in checks.items():
             _, result = run([str(binary), '-S', '-verify-each', *flags, *common], dest / f'check-{mode}')
