@@ -1,6 +1,6 @@
 # JavaType 缓存选择性失效设计与实验报告
 
-本次将 `JavaTypeAnalysis` 原有的三层缓存全量清空，改为修改前通知、沿 SSA 使用关系传播、按依赖范围失效。TCE 和 CHA 已接入。在指定 pass 的生成式 IR 实验中，复杂基础表达式复用场景的 `opt` 总耗时中位数相对同一二进制的全量清空模式下降 17.57%，TCE→CHA 场景下降 16.42%；简单叶子类型场景没有测得稳定收益。
+本次将 `JavaTypeAnalysis` 原有的三层缓存全量清空，改为修改前通知、沿 SSA 使用关系传播、按依赖范围失效。TCE 和 CHA 已接入，RecoverTypeInfo 随后也改用该接口。在指定 pass 的生成式 IR 实验中，复杂基础表达式复用场景的 `opt` 总耗时中位数相对同一二进制的全量清空模式下降 17.57%，TCE→CHA 场景下降 16.42%；简单叶子类型场景没有测得稳定收益。
 
 最终实验时间为 2026 年 10 月 15 日，开发分支为 `feat/javatype-selective-invalidation`，实现提交为 `14058bf207de68fdfbfa09eaa985dddd9983f340`（主体实现 `34cdbcf19`，LVI 内存访问依赖补强 `14058bf20`）。实验前已有的工作区修改独立保存为 `ab6902023`；本次未修改原始 `IR/Jeandle/JavaType.cpp` 查询算法。本文是新实验报告，原工作报告保留。
 
@@ -62,6 +62,12 @@ JavaTypes.getJavaType(V, Context);
 删除基本块时，须通知其中所有即将删除的值并声明 CFG 变化；仅通知分支不能覆盖块内的基础缓存键。跨函数、全局属性、VM 类型关系、无法分类的变更仍使用 `clear()`。当前没有通过 ValueHandle 自动监控任意外部修改；不能省略通知，也不能用类型缓存失效代替 DT/LVI 的维护。
 
 TCE 仍先完成全部折叠决策，再批量通知和修改，不改变决策顺序。CHA 的 `_linkToStatic` 替换保留 CFG，因此保留未受影响的派生基础类型；需要插入接收者非空检查或类型检查的路径声明 CFG 修改。两者在维护依赖后显式保留 JavaTypeAnalysis 和 LVI；其他 pass 没有声明保留时，FAM 仍整体丢弃该分析。
+
+后续接入的消费者只复用缓存、不跨 pass 保留分析：
+
+| Pass | 查询点 | 失效通知 |
+| --- | --- | --- |
+| RecoverTypeInfo | 每个 tracked load 一次语境敏感查询（`RecoverTypeInfo.cpp` 的 `getCtxType`） | 无需通知：emit 阶段前完成全部查询，写入 metadata 后不再查询；返回值不保留 JavaTypeAnalysis，分析随 pass 结束丢弃。同一 base 在多个 load 上的重复查询由 BaseTypes/PathFacts/FinalTypes 吸收 |
 
 本次未改变单次查询的递归状态、预算或结果发布规则。`Processed` 的“有值”表示本次子计算已返回，仍可能受到截断影响；`FactsTruncated` 和 `PhiTruncated` 继续阻止受影响结果进入共享缓存。`PhiCycleHit` 仍可能导致严格相等校验跳过，相关语义验证属于既有后续工作。
 

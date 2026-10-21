@@ -38,11 +38,11 @@ namespace llvm {
 //     ascends once from Top/Bottom to a Known that instanceof-derived facts
 //     prove (see the lattice comment in the .cpp); trajectories are bounded
 //     by klass-chain depth and the fixpoint still converges;
-//   * a context-sensitive getJavaType query on the base at the load's
+//   * a context-sensitive JavaTypeAnalysis query on the base at the load's
 //     position, which additionally sharpens the type through dominating
 //     jeandle.check_instanceof checks. The query is constant during the
 //     fixpoint (the pass mutates no IR until the emit phase) and is cached
-//     per load.
+//     per load, with the analysis' cross-query cache shared between loads.
 //
 // The pass attaches metadata only; it preserves CFGAnalyses and never touches
 // loads that already carry !java-klass (idempotent).
