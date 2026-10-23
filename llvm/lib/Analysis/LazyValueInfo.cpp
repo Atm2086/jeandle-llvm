@@ -934,6 +934,13 @@ LazyValueInfoImpl::solveBlockValueSelect(SelectInst *SI, BasicBlock *BB) {
   // condition itself?  This shows up with idioms like e.g. select(a > 5, a, 5).
   // TODO: We could potentially refine an overdefined true value above.
   Value *Cond = SI->getCondition();
+  // getValueFromCondition cannot derive constraints from a plain argument.
+  // Avoid proving the condition is not undef when it cannot refine either arm.
+  if (isa<Argument>(Cond)) {
+    TrueVal.mergeIn(FalseVal);
+    return TrueVal;
+  }
+
   // If the value is undef, a different value may be chosen in
   // the select condition.
   if (isGuaranteedNotToBeUndef(Cond, AC)) {
