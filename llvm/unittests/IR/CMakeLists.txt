@@ -74,6 +74,13 @@ target_link_libraries(VMCallbackLogRecordReplayTests PRIVATE LLVMTestingSupport)
 add_llvm_unittest(JavaTypeQueryTests
   PARTIAL_SOURCES_INTENDED
   JavaTypeQueryTest.cpp
+  JavaTypeCacheReuseTest.cpp
   )
 
 target_link_libraries(JavaTypeQueryTests PRIVATE LLVMJeandleTransforms)
+
+# Native replay keeps IR construction outside the measured query interval.
+add_llvm_executable(JavaTypeCacheReuseReplay
+  JavaTypeCacheReuseReplay.cpp
+  PARTIAL_SOURCES_INTENDED
+  )
