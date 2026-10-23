@@ -10,9 +10,9 @@
 
 #include "llvm/Analysis/Jeandle/CachedJavaType.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/CFG.h"
@@ -38,8 +38,11 @@ using namespace llvm::jeandle;
 STATISTIC(NumCachedJavaTypeBudgetExhausted,
           "Number of edge-facts queries that hit the per-query join budget");
 
+// TODO:
+// (perf)把连续的、中间没有读取的修改操作合并起来一起处理，这样能减少重复遍历
 JavaTypeCacheInvalidationInfo
-JavaTypeCache::invalidate(ArrayRef<Value *> Changed, bool CFGChanged) {
+JavaTypeCache::invalidate(ArrayRef<Value *> Changed, bool CFGChanged,
+                          JavaTypeBaseInvalidationMode BaseMode) {
   JavaTypeCacheInvalidationInfo Info;
   const size_t OldBase = BaseTypes.size();
   const size_t OldFacts = PathFacts.size();
@@ -71,19 +74,22 @@ JavaTypeCache::invalidate(ArrayRef<Value *> Changed, bool CFGChanged) {
       // LVI also infers non-null facts from dereferences (loads/stores etc.),
       // which need not be SSA users of the value whose facts are cached.
       // Terminators can change the CFG and edge predicates used by LVI.
-      DropContext |= I->isTerminator() || isa<CallBase>(I) ||
-                     I->mayReadOrWriteMemory();
+      DropContext |=
+          I->isTerminator() || isa<CallBase>(I) || I->mayReadOrWriteMemory();
     }
+    // TODO: (perf)这块的复杂度可以优化么
     for (User *U : V->users()) {
       if (++UsesVisited > MaxInvalidationUses) {
         Info.FullClear = true;
         break;
       }
+      // TODO: (perf) 如果Affected中已经包含U，就不需要再次处理了
       Worklist.push_back(U);
     }
     if (Info.FullClear)
       break;
   }
+  Info.UsesVisited = UsesVisited;
 
   auto EraseMatching = [](auto &Map, auto Predicate) {
     for (auto It = Map.begin(), End = Map.end(); It != End;) {
@@ -93,25 +99,42 @@ JavaTypeCache::invalidate(ArrayRef<Value *> Changed, bool CFGChanged) {
     }
   };
   if (Info.FullClear) {
+    Info.BaseSlotsScanned = OldBase;
+    Info.PathFactsSlotsScanned = OldFacts;
+    Info.FinalTypesSlotsScanned = OldFinal;
     clear();
   } else {
-    EraseMatching(BaseTypes, [&](const auto &Entry) {
-      if (Affected.contains(Entry.first))
-        return true;
-      // PHI membership can change without a changed SSA operand being a
-      // user of the rewritten terminator. Retain only direct, context-free
-      // leaf computations across a structural CFG edit.
-      return CFGChanged &&
-             !isa<Argument, CallBase, LoadInst, Constant>(Entry.first);
-    });
+    if (!CFGChanged &&
+        BaseMode == JavaTypeBaseInvalidationMode::SelectiveKeys) {
+      // S1: the affected key set is usually much smaller than BaseTypes.
+      for (Value *V : Affected)
+        BaseTypes.erase(V);
+    } else {
+      // CFG edits must also discard derived entries that are not in the SSA
+      // use closure. Keep the scan as the S0/A-B baseline and for this case.
+      EraseMatching(BaseTypes, [&](const auto &Entry) {
+        ++Info.BaseSlotsScanned;
+        if (Affected.contains(Entry.first))
+          return true;
+        // PHI membership can change without a changed SSA operand being a
+        // user of the rewritten terminator. Retain only direct, context-free
+        // leaf computations across a structural CFG edit.
+        return CFGChanged &&
+               !isa<Argument, CallBase, LoadInst, Constant>(Entry.first);
+      });
+    }
     if (DropContext) {
+      Info.PathFactsSlotsScanned = OldFacts;
+      Info.FinalTypesSlotsScanned = OldFinal;
       PathFacts.clear();
       FinalTypes.clear();
     } else {
       EraseMatching(PathFacts, [&](const auto &Entry) {
+        ++Info.PathFactsSlotsScanned;
         return Affected.contains(Entry.first.first);
       });
       EraseMatching(FinalTypes, [&](const auto &Entry) {
+        ++Info.FinalTypesSlotsScanned;
         return Affected.contains(Entry.first.first);
       });
     }
@@ -443,7 +466,7 @@ static JavaType getBaseJavaTypeRaw(Value *V,
 /// per-call cache is used (the base-only query path).
 static JavaType getBaseJavaType(Value *V,
                                 SmallPtrSetImpl<const PHINode *> &Visited,
-                                BaseMemo *Memo = nullptr){
+                                BaseMemo *Memo = nullptr) {
   BaseMemo LocalMemo;
   BaseMemo &Cache = Memo ? *Memo : LocalMemo;
   bool CycleHit = false;
@@ -1104,7 +1127,8 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
 // option or changing the original JavaType implementation. The cached and
 // reference engines must use the same budget for differential verification.
 static unsigned getFactsJoinBudget() {
-  auto *Option = cl::getRegisteredOptions().lookup("jeandle-max-facts-join-blocks");
+  auto *Option =
+      cl::getRegisteredOptions().lookup("jeandle-max-facts-join-blocks");
   assert(Option && "the original JavaType query option must be registered");
   return static_cast<cl::opt<unsigned> *>(Option)->getValue();
 }
@@ -1147,8 +1171,8 @@ CachedJavaTypeQueryContext::CachedJavaTypeQueryContext(
     DenseMap<std::pair<Value *, BasicBlock *>, JavaType> *PathFacts,
     const DenseMap<std::pair<Value *, BasicBlock *>, JavaType> *FinalTypes)
     : DT(DT), NullOracle(NullOracle), BaseTypes(BaseTypes),
-      PathFacts(PathFacts), FinalTypes(FinalTypes), FactsBudget(getFactsJoinBudget()),
-      PhiBudget(getFactsJoinBudget()) {}
+      PathFacts(PathFacts), FinalTypes(FinalTypes),
+      FactsBudget(getFactsJoinBudget()), PhiBudget(getFactsJoinBudget()) {}
 
 } // namespace
 
@@ -1260,7 +1284,8 @@ static bool isNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
 /// Facts holding about V at the top of BB: the join over non-skipped incoming
 /// edges of (facts at the predecessor, narrowed by the edge guard).
 /// Facts-only: check-derived constraints, never attribute/metadata base types.
-static JavaType factsAt(Value *V, BasicBlock *BB, CachedJavaTypeQueryContext &Q) {
+static JavaType factsAt(Value *V, BasicBlock *BB,
+                        CachedJavaTypeQueryContext &Q) {
   V = stripCastsAndFreeze(V);
 
   // Seed cuts (exact, see the design comment above).
@@ -1420,7 +1445,8 @@ static JavaType valueDimension(Value *V, CachedJavaTypeQueryContext &Q) {
 }
 
 // =============================================================================
-// Cached query entry point. The original engine remains in IR/Jeandle/JavaType.cpp.
+// Cached query entry point. The original engine remains in
+// IR/Jeandle/JavaType.cpp.
 // =============================================================================
 
 JavaType jeandle::getCachedJavaType(Value *V, DominatorTree *DT,
@@ -1428,7 +1454,7 @@ JavaType jeandle::getCachedJavaType(Value *V, DominatorTree *DT,
                                     IsNullEdgeOracle IsNullEdge,
                                     JavaTypeCache &Cache,
                                     CachedJavaTypeQueryInfo &Info) {
-  
+
   Info = {};
   V = stripCastsAndFreeze(V);
   BaseMemo &Memo = Cache.BaseTypes; // 这里使用 Base
@@ -1450,7 +1476,8 @@ JavaType jeandle::getCachedJavaType(Value *V, DominatorTree *DT,
   }
   ++Info.FinalMisses;
 
-  CachedJavaTypeQueryContext Q(*DT, IsNullEdge, Memo, &Cache.PathFacts, &Cache.FinalTypes);
+  CachedJavaTypeQueryContext Q(*DT, IsNullEdge, Memo, &Cache.PathFacts,
+                               &Cache.FinalTypes);
   JavaType T = valueDimension(V, Q);
   JavaType Result = typeIntersect(T, factsAt(V, Context->getParent(), Q));
 

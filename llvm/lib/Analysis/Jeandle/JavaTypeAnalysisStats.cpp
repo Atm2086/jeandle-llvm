@@ -32,6 +32,10 @@ ALWAYS_ENABLED_STATISTIC(TotalInvalidations, "Java type invalidation requests");
 ALWAYS_ENABLED_STATISTIC(TotalSelectiveInvalidations, "Java type selective invalidations");
 ALWAYS_ENABLED_STATISTIC(TotalCFGInvalidations, "Java type CFG invalidations");
 ALWAYS_ENABLED_STATISTIC(TotalInvalidationVisits, "Java type invalidation values visited");
+ALWAYS_ENABLED_STATISTIC(TotalInvalidationUsesVisited, "Java type invalidation uses visited");
+ALWAYS_ENABLED_STATISTIC(TotalBaseSlotsScanned, "Java type invalidation base slots scanned");
+ALWAYS_ENABLED_STATISTIC(TotalPathFactsSlotsScanned, "Java type invalidation path-facts slots scanned");
+ALWAYS_ENABLED_STATISTIC(TotalFinalTypesSlotsScanned, "Java type invalidation final-type slots scanned");
 ALWAYS_ENABLED_STATISTIC(TotalBaseRemoved, "Java type base entries invalidated");
 ALWAYS_ENABLED_STATISTIC(TotalFactsRemoved, "Java type path facts entries invalidated");
 ALWAYS_ENABLED_STATISTIC(TotalFinalRemoved, "Java type final type entries invalidated");
@@ -154,6 +158,14 @@ void JavaTypeStatsAnalysis::Result::onInvalidation(
 
   Stats.InvalidationVisits += Info.ValuesVisited;
   TotalInvalidationVisits += Info.ValuesVisited;
+  Stats.InvalidationUsesVisited += Info.UsesVisited;
+  TotalInvalidationUsesVisited += Info.UsesVisited;
+  Stats.BaseSlotsScanned += Info.BaseSlotsScanned;
+  TotalBaseSlotsScanned += Info.BaseSlotsScanned;
+  Stats.PathFactsSlotsScanned += Info.PathFactsSlotsScanned;
+  TotalPathFactsSlotsScanned += Info.PathFactsSlotsScanned;
+  Stats.FinalTypesSlotsScanned += Info.FinalTypesSlotsScanned;
+  TotalFinalTypesSlotsScanned += Info.FinalTypesSlotsScanned;
   Stats.BaseRemoved += Info.BaseRemoved;
   TotalBaseRemoved += Info.BaseRemoved;
   Stats.FactsRemoved += Info.FactsRemoved;
@@ -210,6 +222,13 @@ void JavaTypeStatsAnalysis::Result::print(raw_ostream &OS) const {
   OS << "  selective invalidations: " << Stats.SelectiveInvalidations << '\n';
   OS << "  CFG invalidations: " << Stats.CFGInvalidations << '\n';
   OS << "  invalidation values visited: " << Stats.InvalidationVisits << '\n';
+  OS << "  invalidation uses visited: " << Stats.InvalidationUsesVisited
+     << '\n';
+  OS << "  invalidation base slots scanned: " << Stats.BaseSlotsScanned << '\n';
+  OS << "  invalidation path-facts slots scanned: " << Stats.PathFactsSlotsScanned
+     << '\n';
+  OS << "  invalidation final-type slots scanned: "
+     << Stats.FinalTypesSlotsScanned << '\n';
   OS << "  base entries invalidated: " << Stats.BaseRemoved << '\n';
   OS << "  path facts entries invalidated: " << Stats.FactsRemoved << '\n';
   OS << "  final type entries invalidated: " << Stats.FinalRemoved << '\n';
@@ -258,6 +277,13 @@ JavaTypeAnalysisSummaryPrinterPass::run(Module &M, ModuleAnalysisManager &) {
   OS << "  selective invalidations: " << TotalSelectiveInvalidations.getValue() << '\n';
   OS << "  CFG invalidations: " << TotalCFGInvalidations.getValue() << '\n';
   OS << "  invalidation values visited: " << TotalInvalidationVisits.getValue() << '\n';
+  OS << "  invalidation uses visited: "
+     << TotalInvalidationUsesVisited.getValue() << '\n';
+  OS << "  invalidation base slots scanned: " << TotalBaseSlotsScanned.getValue() << '\n';
+  OS << "  invalidation path-facts slots scanned: "
+     << TotalPathFactsSlotsScanned.getValue() << '\n';
+  OS << "  invalidation final-type slots scanned: "
+     << TotalFinalTypesSlotsScanned.getValue() << '\n';
   OS << "  base entries invalidated: " << TotalBaseRemoved.getValue() << '\n';
   OS << "  path facts entries invalidated: " << TotalFactsRemoved.getValue() << '\n';
   OS << "  final type entries invalidated: " << TotalFinalRemoved.getValue() << '\n';

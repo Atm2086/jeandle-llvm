@@ -669,6 +669,11 @@ bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
     Type *WideTy =
         PointerType::get(M.getContext(), jeandle::AddrSpace::JavaHeapAddrSpace);
 
+    // Notify while LI and its old use graph are intact. This also covers a
+    // use-empty load: CFF still erases it, and a Java type query could have
+    // populated its base key before this pass ran.
+    notifyChanged();
+
     SmallVector<AddrSpaceCastInst *, 4> DecodeCasts;
     for (User *U : LI->users())
       if (auto *Cast = dyn_cast<AddrSpaceCastInst>(U))
@@ -683,8 +688,6 @@ bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
         WideC = createConstOopLoad(M, Builder, NewOopId);
         ++NumOopChains;
       }
-      // One notification covers both the decode casts (users of LI) and LI.
-      notifyChanged();
       for (AddrSpaceCastInst *Cast : DecodeCasts) {
         Cast->replaceAllUsesWith(WideC);
         Cast->eraseFromParent();
@@ -704,10 +707,6 @@ bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
         NarrowC = Builder.CreateAddrSpaceCast(WideC, LI->getType(),
                                               "folded.narrow.oop");
       }
-      // The decode-cast path above already notified; notify again only when it
-      // did not run, so the narrow replacement of LI is covered too.
-      if (DecodeCasts.empty())
-        notifyChanged();
       LI->replaceAllUsesWith(NarrowC);
     }
     if (LI->use_empty())

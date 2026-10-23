@@ -31,12 +31,21 @@ struct CachedJavaTypeQueryInfo {
   uint64_t FinalMisses = 0;
 };
 
+enum class JavaTypeBaseInvalidationMode {
+  SelectiveKeys,
+  Scan,
+};
+
 /// Work performed by one invalidation. Counts are entries, not bytes.
 struct JavaTypeCacheInvalidationInfo {
   size_t BaseRemoved = 0;
   size_t FactsRemoved = 0;
   size_t FinalRemoved = 0;
   size_t ValuesVisited = 0;
+  size_t UsesVisited = 0;
+  size_t BaseSlotsScanned = 0;
+  size_t PathFactsSlotsScanned = 0;
+  size_t FinalTypesSlotsScanned = 0;
   bool FullClear = false;
 };
 
@@ -70,7 +79,9 @@ public:
   /// SSA users. VM/type-universe changes require clear(). Unsupported roots
   /// or an oversized use closure fall back to clearing all entries.
   LLVM_ABI JavaTypeCacheInvalidationInfo
-  invalidate(ArrayRef<Value *> Changed, bool CFGChanged = false);
+  invalidate(ArrayRef<Value *> Changed, bool CFGChanged = false,
+             JavaTypeBaseInvalidationMode BaseMode =
+                 JavaTypeBaseInvalidationMode::SelectiveKeys);
   size_t baseSize() const { return BaseTypes.size(); }
   size_t pathFactsSize() const { return PathFacts.size(); }
   size_t finalTypesSize() const { return FinalTypes.size(); }

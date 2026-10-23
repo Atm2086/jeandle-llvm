@@ -75,3 +75,5 @@ add_llvm_unittest(JavaTypeQueryTests
   PARTIAL_SOURCES_INTENDED
   JavaTypeQueryTest.cpp
   )
+
+target_link_libraries(JavaTypeQueryTests PRIVATE LLVMJeandleTransforms)

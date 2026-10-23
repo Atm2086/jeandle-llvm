@@ -44,6 +44,11 @@ cl::opt<bool> ForceFullJavaTypeInvalidation(
     cl::desc("Use full clears for Java type mutation notifications (A/B baseline)"),
     cl::Hidden, cl::init(false));
 
+cl::opt<bool> ForceBaseScanJavaTypeInvalidation(
+    "jeandle-java-type-force-base-scan-invalidation",
+    cl::desc("Scan all base cache entries instead of deleting affected keys"),
+    cl::Hidden, cl::init(false));
+
 using QueryClock = std::chrono::steady_clock;
 
 /// Converts the time elapsed since Start into nanoseconds; only called when
@@ -203,7 +208,11 @@ void JavaTypeAnalysisResult::invalidateImpl(ArrayRef<Value *> Changed,
     Info.FullClear = true;
     Cache.clear();
   } else {
-    Info = Cache.invalidate(Changed, CFGChanged);
+    Info = Cache.invalidate(
+        Changed, CFGChanged,
+        ForceBaseScanJavaTypeInvalidation
+            ? JavaTypeBaseInvalidationMode::Scan
+            : JavaTypeBaseInvalidationMode::SelectiveKeys);
   }
   if (!Observer)
     return;

@@ -58,6 +58,10 @@ struct JavaTypeQueryStats {
   uint64_t SelectiveInvalidations = 0;
   uint64_t CFGInvalidations = 0;
   uint64_t InvalidationVisits = 0;
+  uint64_t InvalidationUsesVisited = 0;
+  uint64_t BaseSlotsScanned = 0;
+  uint64_t PathFactsSlotsScanned = 0;
+  uint64_t FinalTypesSlotsScanned = 0;
   uint64_t BaseRemoved = 0;
   uint64_t FactsRemoved = 0;
   uint64_t FinalRemoved = 0;
