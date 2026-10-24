@@ -1,4 +1,5 @@
-//===- ArrayCopySpecialization.cpp - Jeandle arraycopy lowering -----------===//
+//===- CopySpecialization.cpp - Jeandle array and instance copies
+//-----------===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
@@ -8,7 +9,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/Transforms/Jeandle/ArrayCopySpecialization.h"
+#include "llvm/Transforms/Jeandle/CopySpecialization.h"
 #include "llvm/Analysis/Jeandle/LVINullEdgeOracle.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -21,6 +22,7 @@
 #include "llvm/IR/Jeandle/JeandleUtils.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Jeandle/VMConstants.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/Transforms/Jeandle/JeandleTransformUtils.h"
 
@@ -30,72 +32,188 @@ using namespace llvm;
 
 namespace {
 
-#define PROB_MIN (1e-6f)
-#define PROB_MAX (1.0f - 1e-6f)
+constexpr float PROB_MIN = 1e-6f;
+constexpr float PROB_MAX = 1.0f - PROB_MIN;
 
 constexpr uint32_t BranchWeightScale = 1000000;
 
-bool isArrayCopyPseudoCall(CallBase &CB) {
+// The frontend uses i64 offsets and lengths. Accept legacy i32 pseudo calls
+// too, but widen before bounds arithmetic or byte scaling. Real Java runtime
+// entry points retain their i32 ABI and are adapted at the call boundary.
+Value *toI64(IRBuilder<> &B, Value *V, const Twine &Name) {
+  assert(V != nullptr &&
+         (V->getType()->isIntegerTy(32) || V->getType()->isIntegerTy(64)) &&
+         "copy integer operand must be i32 or i64");
+  return B.CreateSExtOrTrunc(V, B.getInt64Ty(), Name);
+}
+
+Value *toI32(IRBuilder<> &B, Value *V, const Twine &Name) {
+  assert(V != nullptr && V->getType()->isIntegerTy() &&
+         "copy integer operand must be an integer");
+  if (V->getType()->isIntegerTy(32))
+    return V;
+  return B.CreateTrunc(V, B.getInt32Ty(), Name);
+}
+
+bool isCopyPseudoCall(CallBase &CB) {
   Function *Callee = CB.getCalledFunction();
   if (!Callee)
     return false;
-  return Callee->getName() == "jeandle.arraycopy" && CB.arg_size() == 9;
+  return Callee->getName() == "jeandle.copy" && CB.arg_size() == 9;
 }
 
-StringRef arrayCopyKind(const CallBase &CI) {
-  Attribute KindAttr = CI.getFnAttr(jeandle::Attribute::ArrayCopyKind);
+StringRef copyKind(const CallBase &CI) {
+  Attribute KindAttr = CI.getFnAttr(jeandle::Attribute::CopyKind);
   return KindAttr.isValid() ? KindAttr.getValueAsString() : StringRef();
 }
 
 bool isArrayCopy(const CallBase &CI) {
-  return arrayCopyKind(CI) == jeandle::Attribute::ArrayCopyKindArrayCopy;
+  return copyKind(CI) == jeandle::Attribute::CopyKindArrayCopy;
 }
 
-bool isValidatedArrayCopy(const CallBase &CB) {
-  return isArrayCopy(CB) &&
-         CB.hasFnAttr(jeandle::Attribute::ValidatedArrayCopy);
+bool isArrayCopyValidated(const CallBase &CI) {
+  return isArrayCopy(CI) && CI.hasFnAttr(jeandle::Attribute::ValidatedCopy);
 }
 
-bool isCloneInst(const CallBase &CI) {
-  return arrayCopyKind(CI) == jeandle::Attribute::ArrayCopyKindCloneInst;
+bool isCopyOf(const CallBase &CI) {
+  return copyKind(CI) == jeandle::Attribute::CopyKindCopyOf;
 }
 
-bool isCloneArray(const CallBase &CI) {
-  return arrayCopyKind(CI) == jeandle::Attribute::ArrayCopyKindCloneArray;
+bool isCopyOfValidated(const CallBase &CI) {
+  return isCopyOf(CI) && CI.hasFnAttr(jeandle::Attribute::ValidatedCopy);
 }
 
-bool isCloneOopArray(const CallBase &CI) {
-  return arrayCopyKind(CI) == jeandle::Attribute::ArrayCopyKindCloneOopArray;
+bool isCopyOfRange(const CallBase &CI) {
+  return copyKind(CI) == jeandle::Attribute::CopyKindCopyOfRange;
 }
 
-bool isCloneBasic(const CallBase &CI) {
-  return isCloneInst(CI) || isCloneArray(CI);
+bool isCopyOfRangeValidated(const CallBase &CI) {
+  return isCopyOfRange(CI) && CI.hasFnAttr(jeandle::Attribute::ValidatedCopy);
+}
+
+bool isInstanceClone(const CallBase &CI) {
+  return copyKind(CI) == jeandle::Attribute::CopyKindCloneInstance;
+}
+
+bool isArrayClone(const CallBase &CI) {
+  return copyKind(CI) == jeandle::Attribute::CopyKindCloneArray;
+}
+
+bool isReferenceArrayClone(const CallBase &CI) {
+  return copyKind(CI) == jeandle::Attribute::CopyKindCloneReferenceArray;
+}
+
+bool isPayloadClone(const CallBase &CI) {
+  // These kinds use byte offsets and a Java-long payload count. The separate
+  // reference-array copy kind uses element indices and an element count.
+  return isInstanceClone(CI) || isArrayClone(CI);
 }
 
 bool hasNegativeLengthGuard(const CallBase &CI) {
-  return CI.hasFnAttr(jeandle::Attribute::ArrayCopyNegativeLengthGuard);
+  return CI.hasFnAttr(jeandle::Attribute::CopyNegativeLengthGuard);
 }
 
-int getLengthIfConstant(CallBase &CI) {
+bool isAllocTightlyCoupled(const CallBase &CI) {
+  return CI.hasFnAttr(jeandle::Attribute::CopyTightlyCoupledAllocation);
+}
+
+struct CopyFacts {
+  CallBase *CB = nullptr;
+  jeandle::JBasicType SrcElem = jeandle::JBasicType::Count;
+  jeandle::JBasicType DestElem = jeandle::JBasicType::Count;
+  std::optional<jeandle::CloneInstanceInfoResult> CloneInstanceInfo;
+};
+
+// Jeandle counterpart of C2's
+// AllocateArrayNode::Ideal_array_allocation(ac->in(ArrayCopyNode::Dest)).
+// The tightly-coupled-allocation attribute carries C2's ArrayCopyNode flag;
+// this helper only recovers the allocation from the destination data edge.
+CallBase *findTightlyCoupledArrayAllocation(CallBase &CI) {
+  if (!isArrayCopy(CI) && !isCopyOf(CI) && !isCopyOfRange(CI) &&
+      !isReferenceArrayClone(CI))
+    return nullptr;
+
+  Value *Dest = CI.getArgOperand(2)->stripPointerCasts();
+  auto *Allocation = dyn_cast<CallBase>(Dest);
+  Function *NewArray = CI.getModule()->getFunction("jeandle.new_array");
+  if (Allocation == nullptr || NewArray == nullptr ||
+      Allocation->getCalledOperand()->stripPointerCasts() != NewArray)
+    return nullptr;
+
+  return Allocation;
+}
+
+bool needsCopyPublicationBarrier(CallBase &CI) {
+  // Payload clones retain the frontend's barrier. Reference-array clones and
+  // copies into fresh arrays need ordering after their final payload stores,
+  // including when those stores replace the pseudo call entirely.
+  return isReferenceArrayClone(CI) ||
+         (isAllocTightlyCoupled(CI) &&
+          findTightlyCoupledArrayAllocation(CI) != nullptr);
+}
+
+// Keep publication ordering as a JavaOp until JavaOperationLower(1), matching
+// the frontend's instance/primitive-array clone path. Standalone modules may
+// lack its template definition; a system release fence supplies the same
+// StoreStore ordering in that case.
+void emitStoreStoreBarrier(IRBuilder<> &B, Module &M) {
+  Function *StoreStore = M.getFunction("jeandle.membar_storestore");
+  if (StoreStore != nullptr && !StoreStore->isDeclaration()) {
+    CallInst *Call = B.CreateCall(StoreStore, {});
+    Call->setCallingConv(CallingConv::Hotspot_JIT);
+    return;
+  }
+
+  B.CreateFence(AtomicOrdering::Release);
+}
+
+CopyFacts analyzeCopy(CallBase &CB, DominatorTree &DT,
+                      jeandle::IsNullEdgeOracle IsNullEdge) {
+  CopyFacts Facts;
+  Facts.CB = &CB;
+
+  // copyOf's frontend guards establish reference-array operands even when
+  // the destination klass comes from a runtime mirror. Such allocations may
+  // have no java-klass return attribute for a JavaType query to recover.
+  if (isCopyOf(CB) || isCopyOfRange(CB)) {
+    Facts.SrcElem = Facts.DestElem = jeandle::JBasicType::Object;
+    return Facts;
+  }
+
+  // JavaType queries themselves need VM type callbacks. Standalone modules
+  // without a VM must keep the generic copy or bulk clone path.
+  const jeandle::VMCallbacks *Callbacks = jeandle::getVMCallbacks();
+  if (Callbacks == nullptr)
+    return Facts;
+
+  if (isArrayCopy(CB)) {
+    const jeandle::JavaType SrcType =
+        jeandle::getJavaType(CB.getArgOperand(0), &DT, &CB, IsNullEdge);
+    const jeandle::JavaType DestType =
+        jeandle::getJavaType(CB.getArgOperand(2), &DT, &CB, IsNullEdge);
+    Facts.SrcElem = jeandle::elementTypeForArrayKlass(SrcType.Klass);
+    Facts.DestElem = jeandle::elementTypeForArrayKlass(DestType.Klass);
+  } else if (isInstanceClone(CB)) {
+    const jeandle::JavaType SrcType =
+        jeandle::getJavaType(CB.getArgOperand(0), &DT, &CB, IsNullEdge);
+    if (SrcType.isKnown() && Callbacks->GetCloneInstanceInfo != nullptr) {
+      Facts.CloneInstanceInfo =
+          Callbacks->GetCloneInstanceInfo(SrcType.Klass, SrcType.Exact);
+    }
+  } else {
+    assert((isArrayClone(CB) || isReferenceArrayClone(CB)) &&
+           "unexpected copy kind");
+  }
+
+  return Facts;
+}
+
+int64_t getLengthIfConstant(CallBase &CI) {
   auto *Length = dyn_cast<ConstantInt>(CI.getArgOperand(4));
   if (Length == nullptr)
     return -1;
 
-  return static_cast<int>(Length->getSExtValue());
-}
-
-// Jeandle counterpart of C2 ArrayCopyNode::get_count().
-int getCount(CallBase &CI) {
-  if (isCloneBasic(CI)) {
-    // TODO: Match C2's clone count calculation for instance and array clones.
-    return -1;
-  }
-
-  return getLengthIfConstant(CI);
-}
-
-jeandle::JBasicType getArrayElementBasicType(uintptr_t Klass) {
-  return jeandle::elementTypeForArrayKlass(Klass);
+  return Length->getSExtValue();
 }
 
 int arrayElementSizeInBytes(Module &M, jeandle::JBasicType ElemType) {
@@ -112,8 +230,9 @@ int arrayBaseOffsetInBytes(Module &M, jeandle::JBasicType ElemType) {
   return static_cast<int>(Constants.arrayBaseOffsetFor(ElemType));
 }
 
-Type *arrayElementStorageType(LLVMContext &Ctx, jeandle::JBasicType ElemType) {
-  switch (ElemType) {
+Type *primitiveCopyStorageType(LLVMContext &Ctx,
+                               jeandle::JBasicType BasicType) {
+  switch (BasicType) {
   case jeandle::JBasicType::Boolean:
   case jeandle::JBasicType::Byte:
     return Type::getInt8Ty(Ctx);
@@ -135,6 +254,55 @@ Type *arrayElementStorageType(LLVMContext &Ctx, jeandle::JBasicType ElemType) {
   llvm_unreachable("unknown JBasicType");
 }
 
+bool isReferenceCopyType(jeandle::JBasicType BasicType) {
+  return BasicType == jeandle::JBasicType::Object;
+}
+
+// Storage types shared by array-element and instance-field copies. Keep oop
+// accesses pointer-typed so InsertGCBarriers can still recognize reference
+// stores.
+Type *copyStorageType(Module &M, jeandle::JBasicType BasicType) {
+  if (isReferenceCopyType(BasicType)) {
+    const int HeapOopBytes =
+        arrayElementSizeInBytes(M, jeandle::JBasicType::Object);
+    assert((HeapOopBytes == 4 || HeapOopBytes == 8) &&
+           "heap oop size must be 4 or 8 bytes");
+    const unsigned OopAddrSpace = HeapOopBytes == 4
+                                      ? jeandle::AddrSpace::NarrowOopAddrSpace
+                                      : jeandle::AddrSpace::JavaHeapAddrSpace;
+    return PointerType::get(M.getContext(), OopAddrSpace);
+  }
+  return primitiveCopyStorageType(M.getContext(), BasicType);
+}
+
+LoadInst *load(IRBuilder<> &B, Value *Address, jeandle::JBasicType BasicType,
+               const Twine &Name) {
+  Module &M = *B.GetInsertBlock()->getModule();
+  Type *StorageType = copyStorageType(M, BasicType);
+  if (StorageType == nullptr)
+    report_fatal_error("unsupported copy load type");
+
+  LoadInst *LoadedValue = B.CreateLoad(StorageType, Address, Name);
+  // Keep accesses below the guards that validate the entire copy. LLVM has
+  // no equivalent of C2's control-dependent pinned arraycopy load; volatile
+  // conservatively prevents speculation and merging across those guards.
+  // Unordered atomicity separately preserves Java's non-tearing accesses.
+  LoadedValue->setVolatile(true);
+  LoadedValue->setAtomic(AtomicOrdering::Unordered);
+  return LoadedValue;
+}
+
+void store(IRBuilder<> &B, Value *Address, Value *StoredValue,
+           jeandle::JBasicType BasicType) {
+  Module &M = *B.GetInsertBlock()->getModule();
+  Type *StorageType = copyStorageType(M, BasicType);
+  if (StorageType == nullptr || StoredValue->getType() != StorageType)
+    report_fatal_error("invalid copy store type");
+
+  StoreInst *Store = B.CreateStore(StoredValue, Address);
+  Store->setAtomic(AtomicOrdering::Unordered);
+}
+
 bool isPrimitiveArrayElementType(jeandle::JBasicType ElemType) {
   return ElemType != jeandle::JBasicType::Count &&
          ElemType != jeandle::JBasicType::Object;
@@ -150,7 +318,7 @@ bool isSubwordArrayElementType(jeandle::JBasicType ElemType) {
 // Jeandle counterpart of
 // C2 ArrayCopyNode::get_partial_inline_vector_lane_count().
 int getPartialInlineVectorLaneCount(Module &M, jeandle::JBasicType Type,
-                                    int ConstLen, int MaxInlineBytes) {
+                                    int64_t ConstLen, int MaxInlineBytes) {
   const int ElementBytes = arrayElementSizeInBytes(M, Type);
   int LaneCount = MaxInlineBytes / ElementBytes;
   if (ConstLen > 0) {
@@ -168,8 +336,6 @@ Value *arrayElementAddress(IRBuilder<> &B, Value *Ary, Value *Idx,
                            jeandle::JBasicType ElemType) {
   assert(Ary != nullptr && Idx != nullptr &&
          "array and index must be available");
-  assert(Idx->getType()->isIntegerTy(32) &&
-         "array index must have Java int type");
 
   Module &M = *B.GetInsertBlock()->getModule();
   const int ElementBytes = arrayElementSizeInBytes(M, ElemType);
@@ -180,19 +346,17 @@ Value *arrayElementAddress(IRBuilder<> &B, Value *Ary, Value *Idx,
       static_cast<unsigned>(Log2_32(static_cast<uint32_t>(ElementBytes)));
   const int Header = arrayBaseOffsetInBytes(M, ElemType);
 
+  Idx = toI64(B, Idx, "arraycopy.index64");
   Value *Base = B.CreateGEP(B.getInt8Ty(), Ary, B.getInt64(Header),
                             "arraycopy.element_base");
-  Value *Index = B.CreateSExt(Idx, B.getInt64Ty(), "arraycopy.index_x");
-  Value *Scale =
-      B.CreateShl(Index, B.getInt64(Shift), "arraycopy.element_scale");
+  Value *Scale = B.CreateShl(Idx, B.getInt64(Shift), "arraycopy.element_scale");
   return B.CreateGEP(B.getInt8Ty(), Base, Scale, "arraycopy.element_address");
 }
 
 // Jeandle counterpart of C2 ArrayCopyNode::prepare_array_copy.
-bool prepareArrayCopy(CallBase &CI, DominatorTree &DT, IRBuilder<> &B,
+bool prepareArrayCopy(CallBase &CI, const CopyFacts &Facts, IRBuilder<> &B,
                       Value *&AdrSrc, Value *&AdrDest,
-                      jeandle::JBasicType &CopyType, bool &DisjointBases,
-                      jeandle::IsNullEdgeOracle IsNullEdge) {
+                      jeandle::JBasicType &CopyType, bool &DisjointBases) {
   AdrSrc = nullptr;
   AdrDest = nullptr;
   CopyType = jeandle::JBasicType::Count;
@@ -200,20 +364,19 @@ bool prepareArrayCopy(CallBase &CI, DominatorTree &DT, IRBuilder<> &B,
 
   Value *BaseSrc = CI.getArgOperand(0);
   Value *SrcOffset = CI.getArgOperand(1);
-  const jeandle::JavaType SrcType =
-      jeandle::getJavaType(BaseSrc, &DT, &CI, IsNullEdge);
-  jeandle::JBasicType SrcElem = getArrayElementBasicType(SrcType.Klass);
+  jeandle::JBasicType SrcElem = Facts.SrcElem;
   Value *BaseDest = CI.getArgOperand(2);
   Value *DestOffset = CI.getArgOperand(3);
 
-  if (isArrayCopy(CI)) {
-    const jeandle::JavaType DestType =
-        jeandle::getJavaType(BaseDest, &DT, &CI, IsNullEdge);
-    jeandle::JBasicType DestElem = getArrayElementBasicType(DestType.Klass);
+  if (isArrayCopy(CI) || isCopyOfRange(CI) || isCopyOf(CI)) {
+    jeandle::JBasicType DestElem = Facts.DestElem;
 
-    // TODO: Match C2 is_alloc_tightly_coupled(). Jeandle does not carry that
-    // allocation relationship on the pseudo call yet.
-    DisjointBases = false;
+    if (isReferenceCopyType(SrcElem))
+      SrcElem = jeandle::JBasicType::Object;
+    if (isReferenceCopyType(DestElem))
+      DestElem = jeandle::JBasicType::Object;
+
+    DisjointBases = isAllocTightlyCoupled(CI);
 
     if (SrcElem == jeandle::JBasicType::Count ||
         DestElem == jeandle::JBasicType::Count) {
@@ -226,20 +389,22 @@ bool prepareArrayCopy(CallBase &CI, DominatorTree &DT, IRBuilder<> &B,
       return false;
     }
 
-    // TODO: Match the remainder of C2 prepare_array_copy(): query BarrierSetC2
-    // before admitting object-array load/store expansion, retain the source
-    // element value_type for typed oop accesses, and model conv_I2X_index()
-    // TOP/out-of-range handling.
-    if (!isPrimitiveArrayElementType(DestElem))
+    // Match the supported collectors' array-copy barrier policy: reference
+    // copies require a fresh destination and reduced initial card marks.
+    // Keep oop accesses typed so InsertGCBarriers can still process them.
+    const auto VMConsts = jeandle::VMConstants::fromModule(*CI.getModule());
+    if (!isPrimitiveArrayElementType(DestElem) &&
+        (DestElem != jeandle::JBasicType::Object || !DisjointBases ||
+         findTightlyCoupledArrayAllocation(CI) == nullptr ||
+         !VMConsts.reduceInitialCardMarks()))
       return false;
+
+    // TODO: Retain the source element value_type for typed oop accesses and
+    // model conv_I2X_index() TOP/out-of-range handling.
 
     CopyType = DestElem;
     AdrSrc = arrayElementAddress(B, BaseSrc, SrcOffset, CopyType);
     AdrDest = arrayElementAddress(B, BaseDest, DestOffset, CopyType);
-  } else {
-    assert(isCloneBasic(CI) && "unexpected arraycopy kind");
-    // TODO: Match C2's clone branch in prepare_array_copy().
-    return false;
   }
 
   return true;
@@ -278,24 +443,20 @@ void arrayCopyForward(BasicBlock *ForwardCtl, jeandle::JBasicType CopyType,
     return;
 
   IRBuilder<> B(ForwardCtl);
-  Type *AccessType = arrayElementStorageType(B.getContext(), CopyType);
+  Type *AccessType = copyStorageType(*ForwardCtl->getModule(), CopyType);
   assert(AccessType != nullptr && "unsupported arraycopy load/store type");
 
   if (Count > 0) {
-    LoadInst *LoadedValue = B.CreateLoad(AccessType, AdrSrc, "arraycopy.load");
-    LoadedValue->setAtomic(AtomicOrdering::Unordered);
-    StoreInst *StoredValue = B.CreateStore(LoadedValue, AdrDest);
-    StoredValue->setAtomic(AtomicOrdering::Unordered);
+    Value *LoadedValue = load(B, AdrSrc, CopyType, "arraycopy.load");
+    store(B, AdrDest, LoadedValue, CopyType);
 
     for (int I = 1; I < Count; ++I) {
       Value *NextSrc = B.CreateInBoundsGEP(AccessType, AdrSrc, B.getInt64(I),
                                            "arraycopy.forward.src");
       Value *NextDest = B.CreateInBoundsGEP(AccessType, AdrDest, B.getInt64(I),
                                             "arraycopy.forward.dest");
-      LoadedValue = B.CreateLoad(AccessType, NextSrc, "arraycopy.load");
-      LoadedValue->setAtomic(AtomicOrdering::Unordered);
-      StoredValue = B.CreateStore(LoadedValue, NextDest);
-      StoredValue->setAtomic(AtomicOrdering::Unordered);
+      LoadedValue = load(B, NextSrc, CopyType, "arraycopy.load");
+      store(B, NextDest, LoadedValue, CopyType);
     }
   } else {
     assert(Count == 0 && "arraycopy count must not be negative");
@@ -310,7 +471,7 @@ void arrayCopyBackward(BasicBlock *BackwardCtl, jeandle::JBasicType CopyType,
     return;
 
   IRBuilder<> B(BackwardCtl);
-  Type *AccessType = arrayElementStorageType(B.getContext(), CopyType);
+  Type *AccessType = copyStorageType(*BackwardCtl->getModule(), CopyType);
   assert(AccessType != nullptr && "unsupported arraycopy load/store type");
 
   for (int I = Count - 1; I >= 0; --I) {
@@ -322,11 +483,8 @@ void arrayCopyBackward(BasicBlock *BackwardCtl, jeandle::JBasicType CopyType,
       DestAddress = B.CreateInBoundsGEP(AccessType, AdrDest, B.getInt64(I),
                                         "arraycopy.backward.dest");
     }
-    LoadInst *LoadedValue =
-        B.CreateLoad(AccessType, SrcAddress, "arraycopy.load");
-    LoadedValue->setAtomic(AtomicOrdering::Unordered);
-    StoreInst *StoredValue = B.CreateStore(LoadedValue, DestAddress);
-    StoredValue->setAtomic(AtomicOrdering::Unordered);
+    Value *LoadedValue = load(B, SrcAddress, CopyType, "arraycopy.load");
+    store(B, DestAddress, LoadedValue, CopyType);
   }
 }
 
@@ -357,42 +515,142 @@ BasicBlock *genSubtypeCheck(IRBuilder<> &B, Module &M, BasicBlock *&ControlBB,
   return NotSubtypeCtrl;
 }
 
+// Jeandle counterpart of C2 ArrayCopyNode::get_count().
+int64_t getScalarCopyCount(
+    CallBase &CI,
+    const std::optional<jeandle::CloneInstanceInfoResult> &CloneInstanceInfo) {
+  if (isPayloadClone(CI)) {
+    // CloneArray's length counts rounded payload longs, not Java elements.
+    // Until the element count is tracked, keep array clones on the bulk path.
+    if (!CloneInstanceInfo.has_value())
+      return -1;
+
+    const auto &Info = *CloneInstanceInfo;
+    const auto Status =
+        static_cast<jeandle::CloneInstanceInfoStatus>(std::get<0>(Info));
+    if (Status != jeandle::CloneInstanceInfoStatus::NotInstance)
+      return std::get<1>(Info);
+
+    return -1;
+  }
+
+  return getLengthIfConstant(CI);
+}
+
+void eraseCopyPseudoCall(CallBase &CI) {
+  assert(CI.getType()->isVoidTy() && CI.use_empty() &&
+         "copy pseudo call must not produce a value");
+  if (auto *Invoke = dyn_cast<InvokeInst>(&CI)) {
+    BasicBlock *Parent = Invoke->getParent();
+    BasicBlock *NormalDest = Invoke->getNormalDest();
+    BasicBlock *UnwindDest = Invoke->getUnwindDest();
+    UnwindDest->removePredecessor(Parent);
+    Invoke->eraseFromParent();
+    BranchInst::Create(NormalDest, Parent);
+    return;
+  }
+  CI.eraseFromParent();
+}
+
+// Jeandle counterpart of C2 ArrayCopyNode::try_clone_instance(). LLVM has no
+// explicit memory Node to return, so preserve C2's return states as:
+// nullopt == not an instance clone, false == declined, true == transformed.
+std::optional<bool> tryScalarizeInstanceClone(
+    CallBase &CI,
+    const std::optional<jeandle::CloneInstanceInfoResult> &CloneInstanceInfo) {
+  if (!isPayloadClone(CI))
+    return std::nullopt;
+
+  if (!CloneInstanceInfo.has_value())
+    return false;
+
+  const auto &Info = *CloneInstanceInfo;
+  Value *BaseSrc = CI.getArgOperand(0);
+  Value *BaseDest = CI.getArgOperand(2);
+  const int StatusValue = std::get<0>(Info);
+  const auto &Fields = std::get<2>(Info);
+  const auto Status =
+      static_cast<jeandle::CloneInstanceInfoStatus>(StatusValue);
+  switch (Status) {
+  case jeandle::CloneInstanceInfoStatus::NotInstance:
+    return std::nullopt;
+  case jeandle::CloneInstanceInfoStatus::NotApplicable:
+  case jeandle::CloneInstanceInfoStatus::TransformFailed:
+    return false;
+  case jeandle::CloneInstanceInfoStatus::RequiresGCBarriers:
+    // Leave the pseudo call for the collector-specific bulk expansion. G1 may
+    // replace it with its barrier-aware runtime clone.
+    return false;
+  case jeandle::CloneInstanceInfoStatus::Ready:
+    break;
+  default:
+    report_fatal_error("invalid clone-instance callback status");
+  }
+
+  IRBuilder<> B(&CI);
+  for (const auto &[Offset, TypeValue] : Fields) {
+    const auto BasicType = static_cast<jeandle::JBasicType>(TypeValue);
+    if (BasicType >= jeandle::JBasicType::Count)
+      report_fatal_error("invalid clone-instance field basic type");
+    if (Offset < 0)
+      report_fatal_error("invalid clone-instance field description");
+
+    Value *OffsetValue = B.getInt64(Offset);
+    Value *SrcAddress = B.CreateInBoundsGEP(B.getInt8Ty(), BaseSrc, OffsetValue,
+                                            "clone.instance.src");
+    Value *DestAddress = B.CreateInBoundsGEP(
+        B.getInt8Ty(), BaseDest, OffsetValue, "clone.instance.dest");
+    Value *LoadedValue = load(B, SrcAddress, BasicType, "clone.instance.load");
+    store(B, DestAddress, LoadedValue, BasicType);
+  }
+
+  // LLVM control flow already represents C2's merged control and memory. Oop
+  // fields retain their pointer address space so InsertGCBarriers can process
+  // them later. TODO: propagate the tightly-coupled allocation property so
+  // that pass can omit the unnecessary pre-barrier and, when
+  // ReduceInitialCardMarks is enabled, the post-barrier as well.
+  eraseCopyPseudoCall(CI);
+  return true;
+}
+
 // Jeandle equivalent of C2 ArrayCopyNode::Ideal().
-bool arrayCopyIdeal(CallBase &CI, DominatorTree &DT,
-                    jeandle::IsNullEdgeOracle IsNullEdge) {
-  assert(isArrayCopyPseudoCall(CI) && "should be an arraycopy");
-  // The ideal path rewrites the invoke's exceptional edges; a call-form
-  // pseudo site has none, so fall back to the generic expansion instead of
-  // casting.
-  if (!isa<InvokeInst>(CI))
+bool tryScalarizeCopy(CallBase &CI, const CopyFacts &Facts) {
+  assert(isCopyPseudoCall(CI) && "should be a copy pseudo call");
+
+  // Small validated array copies and admitted instance clones can be replaced
+  // with loads/stores. Clone admission also checks the GC-barrier policy.
+  if (!isPayloadClone(CI) && !isArrayCopyValidated(CI) &&
+      !isCopyOfRangeValidated(CI) && !isCopyOfValidated(CI))
     return false;
 
-  // See if it's a small array copy and we can inline it as
-  // loads/stores
-  // Here we can only do:
-  // - arraycopy if all arguments were validated before and we don't
-  // need card marking
-  // - clone for which we don't need to do card marking
-  if (!isCloneBasic(CI) && !isValidatedArrayCopy(CI))
-    return false;
-
-  int Count = getCount(CI);
   Module *M = CI.getModule();
   const jeandle::VMConstants VMConsts = jeandle::VMConstants::fromModule(*M);
-  const int MaxElem = static_cast<int>(VMConsts.arrayCopyLoadStoreMaxElem());
-  if (Count < 0 || Count > MaxElem)
-    return false;
+  const int MaxScalarCount =
+      static_cast<int>(VMConsts.arrayCopyLoadStoreMaxElem());
 
-  // TODO: C2 tries try_clone_instance() here. Jeandle still routes instance
-  // clones to clone_at_expansion().
+  const int64_t WideCount = getScalarCopyCount(CI, Facts.CloneInstanceInfo);
+  if (WideCount < 0 || WideCount > MaxScalarCount)
+    return false;
+  const int Count = static_cast<int>(WideCount);
+
+  std::optional<bool> CloneResult =
+      tryScalarizeInstanceClone(CI, Facts.CloneInstanceInfo);
+  if (CloneResult.has_value())
+    return *CloneResult;
+
+  // The generic ideal path below rewrites the invoke's exceptional edges.
+  // A call-form pseudo site has none, but an instance clone above can still
+  // be scalarized without any CFG rewrite.
+  if (!isa<InvokeInst>(CI))
+    return false;
 
   IRBuilder<> B(&CI);
   Value *AdrSrc = nullptr;
   Value *AdrDest = nullptr;
   jeandle::JBasicType CopyType = jeandle::JBasicType::Count;
   bool DisjointBases = false;
-  if (!prepareArrayCopy(CI, DT, B, AdrSrc, AdrDest, CopyType, DisjointBases,
-                        IsNullEdge)) {
+  if (!prepareArrayCopy(CI, Facts, B, AdrSrc, AdrDest, CopyType,
+                        DisjointBases)) {
     assert(AdrSrc == nullptr && "no address can be left behind");
     assert(AdrDest == nullptr && "no address can be left behind");
     return false;
@@ -420,6 +678,10 @@ bool arrayCopyIdeal(CallBase &CI, DominatorTree &DT,
 
   BasicBlock *NormalCtl = Invoke.getNormalDest();
   BasicBlock *ExceptionCtl = Invoke.getUnwindDest();
+  if (needsCopyPublicationBarrier(CI)) {
+    IRBuilder<> ResultFenceBuilder(&Invoke);
+    emitStoreStoreBarrier(ResultFenceBuilder, *M);
+  }
   ExceptionCtl->removePredecessor(ResultCtl);
   Invoke.eraseFromParent();
   BranchInst::Create(NormalCtl, ResultCtl);
@@ -435,7 +697,28 @@ CallInst *makeLeafCall(IRBuilder<> &B, Module &M, FunctionType *CallTy,
     return nullptr;
   assert(Callee->getFunctionType() == CallTy &&
          "leaf call declaration type mismatch");
-  CallInst *Call = B.CreateCall(Callee, Params, Name);
+  assert(Params.size() == CallTy->getNumParams() &&
+         "leaf call argument count mismatch");
+
+  // Keep call sites in the native-width arraycopy representation and adapt
+  // only integer widths required by the selected leaf stub declaration. This
+  // centralizes the i64-to-i32 conversion for the generic arraycopy stub
+  // without weakening pointer/address-space type checking.
+  SmallVector<Value *, 8> CallArgs;
+  CallArgs.reserve(Params.size());
+  for (unsigned I = 0; I < Params.size(); ++I) {
+    Value *Arg = Params[I];
+    Type *Expected = CallTy->getParamType(I);
+    if (Arg->getType() != Expected) {
+      assert(Arg->getType()->isIntegerTy() && Expected->isIntegerTy() &&
+             "leaf call argument type mismatch");
+      Arg = B.CreateIntCast(Arg, Expected, true,
+                            Twine(CallName) + ".arg" + Twine(I));
+    }
+    CallArgs.push_back(Arg);
+  }
+
+  CallInst *Call = B.CreateCall(Callee, CallArgs, Name);
   Call->setCallingConv(CallingConv::C);
   Call->addFnAttr(Attribute::NoUnwind);
   Call->addFnAttr(Attribute::get(B.getContext(), "gc-leaf-function"));
@@ -444,6 +727,38 @@ CallInst *makeLeafCall(IRBuilder<> &B, Module &M, FunctionType *CallTy,
   // infer noalias from the element BasicType: source and destination may
   // overlap, and oop copies also interact with GC barriers.
   return Call;
+}
+
+// Jeandle counterpart of C2 BarrierSetC2::clone_at_expansion().
+bool expandClonePayloadCopy(CallBase &CI) {
+  assert(isPayloadClone(CI) && "must be a clone payload copy");
+
+  Module &M = *CI.getModule();
+  Function *ClonePayload = M.getFunction("jeandle.clone_payload");
+  if (ClonePayload == nullptr || ClonePayload->isDeclaration()) {
+    CI.getContext().emitError(&CI,
+                              "copy-specialization requires a definition of "
+                              "jeandle.clone_payload for payload clones");
+    return false;
+  }
+
+  Value *Src = CI.getArgOperand(0);
+  IRBuilder<> B(&CI);
+  Value *SrcOffset = toI64(B, CI.getArgOperand(1), "clone.src_offset64");
+  Value *Dest = CI.getArgOperand(2);
+  Value *DestOffset = toI64(B, CI.getArgOperand(3), "clone.dest_offset64");
+  Value *PayloadLongCount =
+      toI64(B, CI.getArgOperand(4), "clone.payload_long_count64");
+  CallInst *Expansion = B.CreateCall(
+      ClonePayload, {Src, SrcOffset, Dest, DestOffset, PayloadLongCount,
+                     B.getInt1(isInstanceClone(CI))});
+  Expansion->setCallingConv(CallingConv::Hotspot_JIT);
+
+  // Publication ordering is emitted by the frontend's copy_clone_payload() and
+  // remains in place when this pass replaces the clone pseudo call.
+
+  eraseCopyPseudoCall(CI);
+  return true;
 }
 
 //------------------------------generateGuard---------------------------
@@ -516,28 +831,25 @@ void generateNegativeGuard(BasicBlock *&ControlBB, Value *Index,
   generateGuard(ControlBB, IsNegative, SlowBB, Prefix, BeforeCall, PROB_MIN);
 }
 
-void generateLimitGuard(BasicBlock *&ControlBB, Value *Offset, Value *Length,
-                        Value *ArrayLength, BasicBlock *SlowBB,
-                        StringRef Prefix, CallBase *BeforeCall = nullptr) {
+void generateLimitGuard(BasicBlock *&ControlBB, Value *Offset,
+                        Value *SubseqLength, Value *ArrayLength,
+                        BasicBlock *SlowBB, StringRef Prefix,
+                        CallBase *BeforeCall = nullptr) {
   IRBuilder<> B(ControlBB);
   if (BeforeCall != nullptr)
     B.SetInsertPoint(BeforeCall);
 
   auto *ConstantOffset = dyn_cast<ConstantInt>(Offset);
   const bool ZeroOffset = ConstantOffset != nullptr && ConstantOffset->isZero();
-  if (ZeroOffset && Length == ArrayLength)
+  if (ZeroOffset && SubseqLength == ArrayLength)
     return;
 
-  Type *I64 = B.getInt64Ty();
-  Value *Last = B.CreateSExt(Length, I64, Twine(Prefix) + ".last64");
+  Value *Last = SubseqLength;
   if (!ZeroOffset) {
-    Value *Offset64 = B.CreateSExt(Offset, I64, Twine(Prefix) + ".offset64");
-    Last = B.CreateAdd(Last, Offset64, Twine(Prefix) + ".last");
+    Last = B.CreateAdd(Last, Offset, Twine(Prefix) + ".last");
   }
-  Value *ArrayLength64 =
-      B.CreateSExt(ArrayLength, I64, Twine(Prefix) + ".array_length64");
   Value *ExceedsLimit =
-      B.CreateICmpULT(ArrayLength64, Last, Twine(Prefix) + ".exceeds_limit");
+      B.CreateICmpULT(ArrayLength, Last, Twine(Prefix) + ".exceeds_limit");
   generateGuard(ControlBB, ExceedsLimit, SlowBB, Prefix, BeforeCall, PROB_MIN);
 }
 
@@ -548,7 +860,7 @@ void generatePartialInliningBlock(BasicBlock *&ControlBB, BasicBlock *&ExitBB,
                                   TargetTransformInfo &TTI) {
   assert(ControlBB != nullptr && "arraycopy control must be live");
 
-  Type *ElemTy = arrayElementStorageType(ControlBB->getContext(), BasicType);
+  Type *ElemTy = primitiveCopyStorageType(ControlBB->getContext(), BasicType);
   assert(ElemTy != nullptr && "partial inlining requires a subword type");
 
   Module &M = *ControlBB->getParent()->getParent();
@@ -559,16 +871,13 @@ void generatePartialInliningBlock(BasicBlock *&ControlBB, BasicBlock *&ExitBB,
   const int Log2ElementSize =
       static_cast<int>(Log2_32(static_cast<uint32_t>(ElementBytes)));
 
-  int ConstLen = -1;
+  int64_t ConstLen = -1;
   if (auto *ConstLength = dyn_cast<ConstantInt>(Length64))
-    ConstLen = static_cast<int>(ConstLength->getSExtValue());
+    ConstLen = ConstLength->getSExtValue();
 
   // Avoid constructing an inline/stub split when a compile-time length is
   // already outside the partial-inline limit.
-  int64_t ConstBytes = -1;
-  if (ConstLen >= 0)
-    ConstBytes = static_cast<int64_t>(ConstLen) << Log2ElementSize;
-  if (MaxInlineBytes <= 0 || ConstBytes > MaxInlineBytes)
+  if (MaxInlineBytes <= 0 || ConstLen > MaxInlineBytes / ElementBytes)
     return;
 
   const int LaneCount =
@@ -615,7 +924,11 @@ void generatePartialInliningBlock(BasicBlock *&ControlBB, BasicBlock *&ExitBB,
                                 "arraycopy.partial.inline_ok");
   BranchInst *Guard = HeadBuilder.CreateCondBr(InlineCopy, InlineBB, StubBB);
   MDBuilder MDB(Ctx);
-  Guard->setMetadata(LLVMContext::MD_prof, MDB.createBranchWeights(1, 1));
+  const uint32_t InlineWeight =
+      static_cast<uint32_t>(PROB_MAX * BranchWeightScale);
+  Guard->setMetadata(
+      LLVMContext::MD_prof,
+      MDB.createBranchWeights(InlineWeight, BranchWeightScale - InlineWeight));
 
   IRBuilder<> InlineBuilder(InlineBB);
   Type *MaskBitsTy = InlineBuilder.getIntNTy(VectorLaneCount);
@@ -704,7 +1017,11 @@ CallBase *generateSlowArrayCopy(IRBuilder<> &B, Module &M, CallBase &StateCall,
       PointerType::get(M.getContext(), jeandle::AddrSpace::CHeapAddrSpace),
       "arraycopy.current_thread");
 
-  SmallVector<Value *, 6> Args = {Src, SrcPos, Dest, DestPos, Length, Thread};
+  Value *SrcPosI32 = toI32(B, SrcPos, "arraycopy.slow.src_pos_i32");
+  Value *DestPosI32 = toI32(B, DestPos, "arraycopy.slow.dest_pos_i32");
+  Value *LengthI32 = toI32(B, Length, "arraycopy.slow.length_i32");
+  SmallVector<Value *, 6> Args = {Src,        SrcPosI32, Dest,
+                                  DestPosI32, LengthI32, Thread};
   InvokeInst &StateInvoke = cast<InvokeInst>(StateCall);
   SmallVector<OperandBundleDef, 1> Bundles;
   StateInvoke.getOperandBundlesAsDefs(Bundles);
@@ -720,7 +1037,7 @@ CallBase *generateSlowArrayCopy(IRBuilder<> &B, Module &M, CallBase &StateCall,
 CallInst *generateCheckcastArrayCopy(BasicBlock *&ControlBB,
                                      Value *DestElemKlass, Value *Src,
                                      Value *SrcPos, Value *Dest, Value *DestPos,
-                                     Value *CopyLengthX,
+                                     Value *CopyLength,
                                      bool DestUninitialized) {
   if (ControlBB == nullptr)
     return nullptr;
@@ -733,16 +1050,17 @@ CallInst *generateCheckcastArrayCopy(BasicBlock *&ControlBB,
   Type *I32 = B.getInt32Ty();
   Type *KlassTy = PointerType::get(Ctx, jeandle::AddrSpace::CHeapAddrSpace);
 
-  // TODO: Model StubRoutines::checkcast_arraycopy(dest_uninitialized). Jeandle
-  // currently exposes only the normal StubRoutines_checkcast_arraycopy symbol.
-  (void)DestUninitialized;
-
-  Function *CopyFunc = M.getFunction("StubRoutines_checkcast_arraycopy");
+  StringRef CopyName = DestUninitialized
+                           ? "StubRoutines_checkcast_arraycopy_uninit"
+                           : "StubRoutines_checkcast_arraycopy";
+  Function *CopyFunc = M.getFunction(CopyName);
   if (CopyFunc == nullptr) // Stub was not generated, go slow path.
     return nullptr;
 
   GlobalVariable *SuperCheckOffsetOffsetGlobal =
       M.getGlobalVariable("Klass.super_check_offset_offset", true);
+  if (SuperCheckOffsetOffsetGlobal == nullptr)
+    return nullptr;
   Value *SuperCheckOffsetOffset =
       B.CreateLoad(B.getInt32Ty(), SuperCheckOffsetOffsetGlobal,
                    "arraycopy.super_check_offset_offset");
@@ -763,8 +1081,8 @@ CallInst *generateCheckcastArrayCopy(BasicBlock *&ControlBB,
       I32, {SrcStart->getType(), DestStart->getType(), I64, I64, KlassTy},
       false);
   CallInst *Call = makeLeafCall(
-      B, M, StubTy, "StubRoutines_checkcast_arraycopy",
-      {SrcStart, DestStart, CopyLengthX, CheckOffset, DestElemKlass},
+      B, M, StubTy, CopyName,
+      {SrcStart, DestStart, CopyLength, CheckOffset, DestElemKlass},
       "arraycopy.checkcast.result");
   return Call;
 }
@@ -837,14 +1155,22 @@ Function *basicTypeToArrayCopy(Module &M, jeandle::JBasicType BasicType,
                       : "StubRoutines_jlong_arraycopy";
     break;
   case jeandle::JBasicType::Object:
-    if (DestUninitialized)
-      return nullptr;
-    if (Aligned)
-      Name = Disjoint ? "StubRoutines_arrayof_oop_disjoint_arraycopy"
-                      : "StubRoutines_arrayof_oop_arraycopy";
-    else
-      Name = Disjoint ? "StubRoutines_oop_disjoint_arraycopy"
-                      : "StubRoutines_oop_arraycopy";
+    if (Aligned) {
+      if (Disjoint)
+        Name = DestUninitialized
+                   ? "StubRoutines_arrayof_oop_disjoint_arraycopy_uninit"
+                   : "StubRoutines_arrayof_oop_disjoint_arraycopy";
+      else
+        Name = DestUninitialized ? "StubRoutines_arrayof_oop_arraycopy_uninit"
+                                 : "StubRoutines_arrayof_oop_arraycopy";
+    } else {
+      if (Disjoint)
+        Name = DestUninitialized ? "StubRoutines_oop_disjoint_arraycopy_uninit"
+                                 : "StubRoutines_oop_disjoint_arraycopy";
+      else
+        Name = DestUninitialized ? "StubRoutines_oop_arraycopy_uninit"
+                                 : "StubRoutines_oop_arraycopy";
+    }
     break;
   case jeandle::JBasicType::Count:
     llvm_unreachable("unsupported arraycopy basic type");
@@ -878,11 +1204,6 @@ bool generateUncheckedArrayCopy(BasicBlock *&ControlBB,
     DestStart = arrayElementAddress(B, Dest, DestPos, BasicType);
   }
 
-  Type *I64 = B.getInt64Ty();
-  assert(CopyLength->getType()->isIntegerTy(32) &&
-         "arraycopy copy_length must be an int before ConvI2X");
-  Value *CopyLengthX = B.CreateSExt(CopyLength, I64, "arraycopy.length_x");
-
   BasicBlock *PartialExitBB = nullptr;
   const jeandle::VMConstants VMConsts = jeandle::VMConstants::fromModule(M);
   const int MaxInlineBytes =
@@ -890,7 +1211,7 @@ bool generateUncheckedArrayCopy(BasicBlock *&ControlBB,
 
   if (MaxInlineBytes > 0 && isSubwordArrayElementType(BasicType)) {
     generatePartialInliningBlock(ControlBB, PartialExitBB, BasicType, SrcStart,
-                                 DestStart, CopyLengthX, MaxInlineBytes, TTI);
+                                 DestStart, CopyLength, MaxInlineBytes, TTI);
   }
 
   IRBuilder<> StubBuilder(ControlBB);
@@ -899,7 +1220,7 @@ bool generateUncheckedArrayCopy(BasicBlock *&ControlBB,
       {SrcStart->getType(), DestStart->getType(), StubBuilder.getInt64Ty()},
       false);
   CallInst *StubCall = makeLeafCall(StubBuilder, M, StubTy, StubNameForCall,
-                                    {SrcStart, DestStart, CopyLengthX});
+                                    {SrcStart, DestStart, CopyLength});
   assert(StubCall != nullptr && "selected arraycopy stub must be declared");
   (void)StubCall;
 
@@ -913,27 +1234,41 @@ bool generateUncheckedArrayCopy(BasicBlock *&ControlBB,
 }
 
 // This is the Jeandle equivalent of C2 PhaseMacroExpand::generate_arraycopy()
-bool generateArrayCopy(CallBase &CI, BasicBlock *&ControlBB,
+bool generateArrayCopy(CallBase &CI, CallBase *Allocation,
+                       BasicBlock *&ControlBB,
                        jeandle::JBasicType BasicElemType, Value *Src,
                        Value *SrcPos, Value *Dest, Value *DestPos,
-                       Value *Length, bool DisjointBases,
+                       Value *CopyLength, bool DisjointBases,
                        bool LengthNeverNegative, BasicBlock *SlowRegion,
                        TargetTransformInfo &TTI) {
 
   Module *M = CI.getModule();
   LLVMContext &Ctx = CI.getContext();
   Function *F = ControlBB->getParent();
+  const bool NeedsPublicationBarrier = needsCopyPublicationBarrier(CI);
   InvokeInst &Invoke = cast<InvokeInst>(CI);
   BasicBlock *UnwindDest = Invoke.getUnwindDest();
   if (SlowRegion == nullptr)
     SlowRegion = BasicBlock::Create(Ctx, "arraycopy.slow_region", F);
 
-  bool AcopyToUninitialized = false; // now it's always false
+  bool AcopyToUninitialized = false;
 
-  // TODO: Model C2s tightly-coupled allocation path here, before deriving
-  // arraycopy addresses or selecting stubs: ReduceBulkZeroing,
-  // InitializeNode::set_complete_with_arraycopy(), acopy_to_uninitialized, and
-  // head/tail zeroing of the non-copied destination ranges.
+  // See if this is the initialization of a freshly allocated array.  This is
+  // the Jeandle counterpart of C2's acopy_to_uninitialized decision.  Jeandle
+  // still performs the complete new_array zeroing, so this flag only selects
+  // the GC barrier stub variant that may omit the destination pre-barrier; it
+  // does not yet request C2's head-and-tail-zeroing optimization. Keep the
+  // stub selection gated by ReduceBulkZeroing, matching C2's contract when
+  // that optimization is disabled.
+  const jeandle::VMConstants VMConsts = jeandle::VMConstants::fromModule(*M);
+  if (VMConsts.reduceBulkZeroing() && Allocation != nullptr) {
+    assert((isArrayCopy(CI) || isCopyOf(CI) || isCopyOfRange(CI) ||
+            isReferenceArrayClone(CI)) &&
+           "unexpected tightly coupled arraycopy kind");
+    assert(Allocation == CI.getArgOperand(2)->stripPointerCasts() &&
+           "allocation must produce the arraycopy destination");
+    AcopyToUninitialized = true;
+  }
 
   // Results are placed here. LLVM represents C2's result_region with a
   // common successor block and explicit CFG edges.
@@ -964,7 +1299,7 @@ bool generateArrayCopy(CallBase &CI, BasicBlock *&ControlBB,
 
   if (BasicElemType == jeandle::JBasicType::Count) {
     CheckedValue = generateGenericArrayCopy(*M, Src, SrcPos, Dest, DestPos,
-                                            Length, ControlBB);
+                                            CopyLength, ControlBB);
     if (CheckedValue == nullptr)
       CheckedValue = ConstantInt::get(Type::getInt32Ty(Ctx), -1);
     CheckedControl = ControlBB;
@@ -973,13 +1308,14 @@ bool generateArrayCopy(CallBase &CI, BasicBlock *&ControlBB,
 
   // C2 generate_arraycopy() handles length <= 0 before address/stub expansion.
   BasicBlock *NotPosBB =
-      generateNonpositiveGuard(ControlBB, Length, LengthNeverNegative);
+      generateNonpositiveGuard(ControlBB, CopyLength, LengthNeverNegative);
   if (NotPosBB != nullptr) {
     BasicBlock *LocalCtrl = NotPosBB;
 
     // (6) length must not be negative.
     if (!LengthNeverNegative)
-      generateNegativeGuard(LocalCtrl, Length, SlowRegion, "arraycopy.length");
+      generateNegativeGuard(LocalCtrl, CopyLength, SlowRegion,
+                            "arraycopy.length");
 
     // copy_length is 0.
     // TODO: Match C2's dest_needs_zeroing zero-length path: when the tightly
@@ -1007,7 +1343,8 @@ bool generateArrayCopy(CallBase &CI, BasicBlock *&ControlBB,
     // Otherwise use checkcast_arraycopy, which backs off to slow_arraycopy on
     // the first per-oop check that fails.
     const bool SkipSubtypeCheck =
-        isValidatedArrayCopy(CI) || isCloneOopArray(CI);
+        isArrayCopyValidated(CI) || isCopyOfValidated(CI) ||
+        isCopyOfRangeValidated(CI) || isReferenceArrayClone(CI);
     if (!SkipSubtypeCheck) {
       IRBuilder<> B(ControlBB);
       Value *SrcKlass = CI.getArgOperand(5);
@@ -1027,15 +1364,10 @@ bool generateArrayCopy(CallBase &CI, BasicBlock *&ControlBB,
       CallInst *DestElemKlass =
           CheckcastBuilder.CreateCall(LoadArrayElementKlass, {DestKlass});
       DestElemKlass->setCallingConv(CallingConv::Hotspot_JIT);
-      Type *I64 = CheckcastBuilder.getInt64Ty();
-      assert(Length->getType()->isIntegerTy(32) &&
-             "arraycopy copy_length must be an int before ConvI2X");
-      Value *CopyLengthX = CheckcastBuilder.CreateSExt(
-          Length, I64, "arraycopy.checkcast.length_x");
       BasicBlock *CheckcastControl = CheckcastBuilder.GetInsertBlock();
       CheckedValue = generateCheckcastArrayCopy(
           CheckcastControl, DestElemKlass, Src, SrcPos, Dest, DestPos,
-          CopyLengthX, AcopyToUninitialized);
+          CopyLength, AcopyToUninitialized);
       if (CheckedValue == nullptr)
         CheckedValue = ConstantInt::get(Type::getInt32Ty(Ctx), -1);
       CheckedControl = CheckcastControl;
@@ -1051,7 +1383,7 @@ bool generateArrayCopy(CallBase &CI, BasicBlock *&ControlBB,
     // than an explicit C2 MergeMemNode clone.
     const bool FastPathGenerated = generateUncheckedArrayCopy(
         ControlBB, BasicElemType, DisjointBases, Src, SrcPos, Dest, DestPos,
-        Length, AcopyToUninitialized, TTI);
+        CopyLength, AcopyToUninitialized, TTI);
 
     // C2 records this edge in result_region. LLVM needs an explicit branch.
     if (FastPathGenerated && ControlBB != nullptr) {
@@ -1092,9 +1424,10 @@ bool generateArrayCopy(CallBase &CI, BasicBlock *&ControlBB,
     // block.
     IRBuilder<> SlowOffsetBuilder(SlowControl);
     PHINode *SlowOffsetPhi = SlowOffsetBuilder.CreatePHI(
-        Length->getType(), 2, "arraycopy.slow.offset");
-    SlowOffsetPhi->addIncoming(ConstantInt::get(Length->getType(), 0),
-                               SlowRegion);
+        CopyLength->getType(), 2, "arraycopy.slow.offset");
+    SlowOffsetPhi->addIncoming(
+        ConstantInt::get(cast<IntegerType>(CopyLength->getType()), 0),
+        SlowRegion);
 
     IRBuilder<> CheckedFailureBuilder(CheckedFailure);
     // TODO: Model C2's alloc != nullptr path here. C2 restarts from the
@@ -1107,20 +1440,22 @@ bool generateArrayCopy(CallBase &CI, BasicBlock *&ControlBB,
     Value *Copied = CheckedFailureBuilder.CreateXor(
         CheckedValue, CheckedFailureBuilder.getInt32(-1),
         "arraycopy.checkcast.copied");
-    SlowOffsetPhi->addIncoming(Copied, CheckedFailure);
+    Value *CopiedX = CheckedFailureBuilder.CreateIntCast(
+        Copied, CopyLength->getType(), true, "arraycopy.checkcast.copied_x");
+    SlowOffsetPhi->addIncoming(CopiedX, CheckedFailure);
     CheckedFailureBuilder.CreateBr(SlowControl);
 
     Value *SrcPosPlus = SlowOffsetBuilder.CreateAdd(SrcPos, SlowOffsetPhi,
                                                     "arraycopy.slow.src_pos");
     Value *DestPosPlus = SlowOffsetBuilder.CreateAdd(DestPos, SlowOffsetPhi,
                                                      "arraycopy.slow.dest_pos");
-    Value *LengthMinus = SlowOffsetBuilder.CreateSub(Length, SlowOffsetPhi,
+    Value *LengthMinus = SlowOffsetBuilder.CreateSub(CopyLength, SlowOffsetPhi,
                                                      "arraycopy.slow.length");
 
     // Tweak the node variables to adjust the code produced below:
     SrcPos = SrcPosPlus;
     DestPos = DestPosPlus;
-    Length = LengthMinus;
+    CopyLength = LengthMinus;
   }
 
   // No unchecked fast path was generated; connect the remaining control to the
@@ -1141,7 +1476,14 @@ bool generateArrayCopy(CallBase &CI, BasicBlock *&ControlBB,
 
     // TODO: Model C2s dest_needs_zeroing cleanup before the fixed slow invoke.
     generateSlowArrayCopy(SlowBuilder, *M, CI, Src, SrcPos, Dest, DestPos,
-                          Length);
+                          CopyLength);
+  }
+
+  // Order all successful copy paths, including zero-length and slow copies,
+  // before publishing the freshly allocated destination.
+  if (NeedsPublicationBarrier) {
+    IRBuilder<> ResultFenceBuilder(ResultRegion->getTerminator());
+    emitStoreStoreBarrier(ResultFenceBuilder, *M);
   }
 
   CI.deleteValue();
@@ -1149,47 +1491,70 @@ bool generateArrayCopy(CallBase &CI, BasicBlock *&ControlBB,
   return true;
 }
 
-// Expand one jeandle.arraycopy pseudo call. This is the Jeandle equivalent of
+// Expand one jeandle.copy pseudo call. This is the Jeandle equivalent of
 // C2 PhaseMacroExpand::expand_arraycopy_node(ArrayCopyNode *ac)
-bool expandArrayCopyNode(CallBase &CI, DominatorTree &DT,
-                         TargetTransformInfo &TTI,
-                         jeandle::IsNullEdgeOracle IsNullEdge) {
-  assert(isArrayCopyPseudoCall(CI) && "should be an arraycopy");
+bool expandCopyPseudoCall(CallBase &CI, const CopyFacts &Facts,
+                          TargetTransformInfo &TTI) {
+  assert(isCopyPseudoCall(CI) && "should be a copy pseudo call");
+
+  if (isPayloadClone(CI)) {
+    return expandClonePayloadCopy(CI);
+  }
 
   Value *Src = CI.getArgOperand(0);
-  Value *SrcPos = CI.getArgOperand(1);
+  IRBuilder<> B(&CI);
+  Value *SrcPos = toI64(B, CI.getArgOperand(1), "arraycopy.src_pos64");
   Value *Dest = CI.getArgOperand(2);
-  Value *DestPos = CI.getArgOperand(3);
-  Value *Length = CI.getArgOperand(4);
+  // Preserve equal-offset identity, which also proves a disjoint copy direction
+  // when the bases alias. Separate sext instructions would hide that fact.
+  Value *DestPos = CI.getArgOperand(3) == CI.getArgOperand(1)
+                       ? SrcPos
+                       : toI64(B, CI.getArgOperand(3), "arraycopy.dest_pos64");
+  Value *Length = toI64(B, CI.getArgOperand(4), "arraycopy.length64");
+  Value *SrcLength = toI64(B, CI.getArgOperand(7), "arraycopy.src_length64");
+  Value *DestLength =
+      CI.getArgOperand(8) == CI.getArgOperand(7)
+          ? SrcLength
+          : toI64(B, CI.getArgOperand(8), "arraycopy.dest_length64");
   LLVMContext &Ctx = CI.getContext();
   BasicBlock *ControlBB = CI.getParent();
   Function *F = ControlBB->getParent();
 
-  if (isCloneBasic(CI)) {
-    // TODO: Match C2's clone_at_expansion() path.
-    return false;
-  } else if (isCloneOopArray(CI)) {
-    // TODO: Match C2's CloneOopArray expansion path.
-    return false;
+  if (isCopyOf(CI) || isCopyOfRange(CI) || isReferenceArrayClone(CI)) {
+    // The frontend admits only reference arrays for copyOf[Range], validates
+    // source/range/new-length checks, and passes min(available, newLength) as
+    // the moved count. The destination is fresh and fully zeroed, so these
+    // kinds can use Object/disjoint expansion without ordinary bounds guards.
+    // The validated attribute separately proves element assignability; its
+    // absence still requires the subtype/checkcast path below.
+    CallBase *Allocation = isAllocTightlyCoupled(CI)
+                               ? findTightlyCoupledArrayAllocation(CI)
+                               : nullptr;
+
+    return generateArrayCopy(CI, Allocation, ControlBB,
+                             jeandle::JBasicType::Object, Src, SrcPos, Dest,
+                             DestPos, Length, /*DisjointBases=*/true,
+                             hasNegativeLengthGuard(CI), nullptr, TTI);
   }
 
-  // TODO: Match C2 is_alloc_tightly_coupled() and recover the corresponding
-  // AllocateArrayNode with Ideal_array_allocation().
+  CallBase *Allocation = isAllocTightlyCoupled(CI)
+                             ? findTightlyCoupledArrayAllocation(CI)
+                             : nullptr;
 
   // Compile time checks.  If any of these checks cannot be verified at compile
   // time, we do not make a fast path for this call.  Instead, we let the call
   // remain as it is.  The checks we choose to mandate at compile time are:
   //
   // (1) src and dest are arrays.
-  const jeandle::JavaType SrcType =
-      jeandle::getJavaType(Src, &DT, &CI, IsNullEdge);
-  const jeandle::JavaType DestType =
-      jeandle::getJavaType(Dest, &DT, &CI, IsNullEdge);
+  jeandle::JBasicType SrcElem = Facts.SrcElem;
+  jeandle::JBasicType DestElem = Facts.DestElem;
 
-  jeandle::JBasicType SrcElem = getArrayElementBasicType(SrcType.Klass);
-  jeandle::JBasicType DestElem = getArrayElementBasicType(DestType.Klass);
+  if (isReferenceCopyType(SrcElem))
+    SrcElem = jeandle::JBasicType::Object;
+  if (isReferenceCopyType(DestElem))
+    DestElem = jeandle::JBasicType::Object;
 
-  if (isValidatedArrayCopy(CI) && DestElem != jeandle::JBasicType::Count &&
+  if (isArrayCopyValidated(CI) && DestElem != jeandle::JBasicType::Count &&
       SrcElem == jeandle::JBasicType::Count) {
     SrcElem = DestElem;
   }
@@ -1203,13 +1568,13 @@ bool expandArrayCopyNode(CallBase &CI, DominatorTree &DT,
     // Jeandle starts modeling C2-like memory slices here.
 
     // Call StubRoutines::generic_arraycopy stub.
-    return generateArrayCopy(CI, ControlBB, jeandle::JBasicType::Count, Src,
-                             SrcPos, Dest, DestPos, Length,
+    return generateArrayCopy(CI, nullptr, ControlBB, jeandle::JBasicType::Count,
+                             Src, SrcPos, Dest, DestPos, Length,
                              /*DisjointBases*/ false,
                              hasNegativeLengthGuard(CI), nullptr, TTI);
   }
 
-  assert((!isValidatedArrayCopy(CI) || SrcElem == DestElem) &&
+  assert((!isArrayCopyValidated(CI) || SrcElem == DestElem) &&
          "validated but different basic types");
 
   // (2) src and dest arrays must have elements of the same BasicType.
@@ -1237,7 +1602,7 @@ bool expandArrayCopyNode(CallBase &CI, DominatorTree &DT,
 
   BasicBlock *SlowBB = BasicBlock::Create(Ctx, "arraycopy.slow_region", F);
 
-  if (!isValidatedArrayCopy(CI)) {
+  if (!isArrayCopyValidated(CI)) {
     // (3) operands must not be null.
     // Null checks are done during Jeandle bytecode lowering before the pseudo
     // call is emitted, matching C2s "null checks done library_call.cpp"
@@ -1256,7 +1621,6 @@ bool expandArrayCopyNode(CallBase &CI, DominatorTree &DT,
     // (7) src_offset + length must not exceed length of src.
     // Match C2 macro expansion:
     //   Node* alen = ac->in(ArrayCopyNode::SrcLen);
-    Value *SrcLength = CI.getArgOperand(7);
     assert(SrcLength != nullptr && "need src len");
     generateLimitGuard(ControlBB, SrcPos, Length, SrcLength, SlowBB,
                        "arraycopy.unvalidated.src", &CI);
@@ -1264,7 +1628,6 @@ bool expandArrayCopyNode(CallBase &CI, DominatorTree &DT,
     // (8) dest_offset + length must not exceed length of dest.
     // Match C2 macro expansion:
     //   Node* alen = ac->in(ArrayCopyNode::DestLen);
-    Value *DestLength = CI.getArgOperand(8);
     assert(DestLength != nullptr && "need dest len");
     generateLimitGuard(ControlBB, DestPos, Length, DestLength, SlowBB,
                        "arraycopy.unvalidated.dest", &CI);
@@ -1273,48 +1636,76 @@ bool expandArrayCopyNode(CallBase &CI, DominatorTree &DT,
     // The generateArrayCopy subroutine checks this.
   }
 
-  return generateArrayCopy(CI, ControlBB, DestElem, Src, SrcPos, Dest, DestPos,
-                           Length, false, hasNegativeLengthGuard(CI), SlowBB,
-                           TTI);
+  return generateArrayCopy(CI, Allocation, ControlBB, DestElem, Src, SrcPos,
+                           Dest, DestPos, Length, false,
+                           hasNegativeLengthGuard(CI), SlowBB, TTI);
 }
 } // namespace
 
-PreservedAnalyses ArrayCopySpecialization::run(Function &F,
-                                               FunctionAnalysisManager &FAM) {
+PreservedAnalyses CopySpecialization::run(Function &F,
+                                          FunctionAnalysisManager &FAM) {
   if (!jeandle::isRootJavaMethodFunction(F))
     return PreservedAnalyses::all();
 
-  SmallVector<CallBase *, 8> PseudoCalls;
-  for (Instruction &I : instructions(F))
-    if (auto *CB = dyn_cast<CallBase>(&I))
-      if (isArrayCopyPseudoCall(*CB))
-        PseudoCalls.push_back(CB);
-
   DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-  TargetTransformInfo &TTI = FAM.getResult<TargetIRAnalysis>(F);
-  // The null-edge oracle needs LazyValueInfo, whose cached per-block lattice
-  // goes stale when a site rewrite rewrites the CFG. Queries for a site run
-  // before its rewrite, and every successful rewrite clears the cache (and
-  // recalculates the dominator tree), so each query sees state consistent
-  // with the current CFG.
   LazyValueInfo &LVI = FAM.getResult<LazyValueAnalysis>(F);
   LVINullEdgeOracle IsNullEdge{LVI};
+
+  // Freeze every dominance-dependent fact before rewriting any pseudo call.
+  // CFG expansion invalidates DT and LVI, but the element types and clone
+  // callback result remain valid for each original call site.
+  SmallVector<CopyFacts, 8> Worklist;
+  for (Instruction &I : instructions(F)) {
+    auto *CB = dyn_cast<CallBase>(&I);
+    if (CB == nullptr || !isCopyPseudoCall(*CB))
+      continue;
+
+    // Validate frontend contracts before scalarization or CFG rewriting. In
+    // particular, losing a fresh allocation must not silently drop its
+    // publication fence in builds without assertions.
+    if (!isPayloadClone(*CB)) {
+      if (!isa<InvokeInst>(CB)) {
+        F.getContext().emitError(
+            CB, "copy-specialization requires an invoke for array copies");
+        return PreservedAnalyses::all();
+      }
+      if (isAllocTightlyCoupled(*CB) &&
+          findTightlyCoupledArrayAllocation(*CB) == nullptr) {
+        F.getContext().emitError(
+            CB, "copy-specialization requires a direct jeandle.new_array "
+                "destination for tightly coupled array copies");
+        return PreservedAnalyses::all();
+      }
+    }
+
+    CopyFacts Facts = analyzeCopy(*CB, DT, IsNullEdge);
+    if (Facts.CloneInstanceInfo.has_value()) {
+      const auto &[Status, Count, Fields] = *Facts.CloneInstanceInfo;
+      if (Status == static_cast<int>(jeandle::CloneInstanceInfoStatus::Ready) &&
+          (Count < 0 || static_cast<size_t>(Count) != Fields.size())) {
+        F.getContext().emitError(
+            CB, "copy-specialization requires a clone-instance field count "
+                "matching its field descriptions");
+        return PreservedAnalyses::all();
+      }
+    }
+    Worklist.push_back(std::move(Facts));
+  }
+
+  TargetTransformInfo &TTI = FAM.getResult<TargetIRAnalysis>(F);
   bool Changed = false;
-  for (CallBase *CB : PseudoCalls) {
+  for (CopyFacts &Facts : Worklist) {
+    CallBase *CB = Facts.CB;
     if (CB->getParent() == nullptr)
       continue;
 
     bool CallChanged = false;
-    if (arrayCopyIdeal(*CB, DT, IsNullEdge))
+    if (tryScalarizeCopy(*CB, Facts))
       CallChanged = true;
     else
-      CallChanged |= expandArrayCopyNode(*CB, DT, TTI, IsNullEdge);
+      CallChanged |= expandCopyPseudoCall(*CB, Facts, TTI);
 
     Changed |= CallChanged;
-    if (CallChanged) {
-      DT.recalculate(F);
-      LVI.clear();
-    }
   }
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();

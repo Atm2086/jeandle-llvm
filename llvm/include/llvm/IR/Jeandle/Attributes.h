@@ -73,19 +73,24 @@ public:
   static constexpr const char *ProfileDevirtualizationMiss =
       "profile-devirtualization-miss";
 
-  /// Classification attributes attached to jeandle.arraycopy call sites.
-  static constexpr const char *ArrayCopyKind = "jeandle.arraycopy.kind";
+  /// Classification attributes attached to jeandle.copy call sites.
+  static constexpr const char *CopyKind = "jeandle.copy.kind";
 
-  static constexpr const char *ValidatedArrayCopy =
-      "jeandle.arraycopy.validated";
+  static constexpr const char *ValidatedCopy = "jeandle.copy.validated";
 
-  static constexpr const char *ArrayCopyNegativeLengthGuard =
-      "jeandle.arraycopy.negative-length-guard";
+  static constexpr const char *CopyNegativeLengthGuard =
+      "jeandle.copy.negative-length-guard";
 
-  static constexpr const char *ArrayCopyKindArrayCopy = "arraycopy";
-  static constexpr const char *ArrayCopyKindCloneInst = "clone-inst";
-  static constexpr const char *ArrayCopyKindCloneArray = "clone-array";
-  static constexpr const char *ArrayCopyKindCloneOopArray = "clone-oop-array";
+  static constexpr const char *CopyTightlyCoupledAllocation =
+      "jeandle.copy.tightly-coupled-allocation";
+
+  static constexpr const char *CopyKindArrayCopy = "arraycopy";
+  static constexpr const char *CopyKindCopyOf = "copyof";
+  static constexpr const char *CopyKindCopyOfRange = "copyof-range";
+  static constexpr const char *CopyKindCloneInstance = "clone-instance";
+  static constexpr const char *CopyKindCloneArray = "clone-array";
+  static constexpr const char *CopyKindCloneReferenceArray =
+      "clone-reference-array";
 };
 
 } // namespace llvm::jeandle

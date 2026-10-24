@@ -16,7 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
-#include "llvm/Analysis/Jeandle/JavaTypeAnalysis.h"
+#include "llvm/Analysis/Jeandle/LVINullEdgeOracle.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
@@ -27,6 +27,7 @@
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Transforms/Jeandle/JeandleTransformUtils.h"
 
 #define DEBUG_TYPE "type-check-elimination"
 
@@ -67,7 +68,14 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
   if (!CheckFn && !SubtypeFn)
     return PreservedAnalyses::all();
 
-  auto &JavaTypes = FAM.getResult<jeandle::JavaTypeAnalysis>(F);
+  DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+  // The LVI snapshot stays safe for the whole pass because TCE only erases
+  // non-terminator CallInsts and never splits blocks: LVI's ValueHandles purge
+  // erased/RAUW'd values from its caches, and block-value state stays valid
+  // while the CFG is unchanged. A fold that touches terminators or blocks
+  // would need to drop the oracle first.
+  LazyValueInfo &LVI = FAM.getResult<LazyValueAnalysis>(F);
+  LVINullEdgeOracle IsNullEdge{LVI};
 
   // Collect check_instanceof and check_klass_subtype calls. CallInst only:
   // the check helpers are never emitted as invokes, and an invoke must not be
@@ -129,11 +137,12 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     // helper's IR contract requires this oop operand to be non-null, so
     // check_instanceof-derived sharpening remains sound even though JavaType
     // itself does not model nullability.
-    jeandle::JavaType ObjType = JavaTypes.getJavaType(Obj, CheckCB);
+    jeandle::JavaType ObjType =
+        jeandle::getJavaType(Obj, &DT, CheckCB, IsNullEdge);
 
     // --- Fold to true: known subtype ---
-    if (ObjType.isKnown() && (CB->IsSubtype(ObjType.Klass, SuperKlass) ||
-                              ObjType.Interfaces.contains(SuperKlass))) {
+    if ((ObjType.isKnown() && CB->IsSubtype(ObjType.Klass, SuperKlass)) ||
+        ObjType.Interfaces.contains(SuperKlass)) {
       Folds.push_back({CheckCB, ConstantInt::getTrue(CheckCB->getType())});
       continue;
     }
@@ -166,13 +175,6 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
   }
 
   // --- Apply all folds ---
-  // Capture old uses before RAUW erases the dependency on each check. Batch
-  // notifications so shared users are traversed only once.
-  SmallVector<Value *, 16> ChangedChecks;
-  for (const FoldDecision &Fold : Folds)
-    ChangedChecks.push_back(Fold.Check);
-  if (!ChangedChecks.empty())
-    JavaTypes.invalidate(ChangedChecks);
   bool Changed = false;
   for (const FoldDecision &F : Folds)
     Changed |= foldCheckToConstant(F.Check, F.Result);
@@ -180,13 +182,8 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
   if (!Changed)
     return PreservedAnalyses::all();
 
-  // Branch predicates may have changed even though CFG edges did not.
-  FAM.getResult<LazyValueAnalysis>(F).clear();
-
   PreservedAnalyses PA;
   PA.preserveSet<CFGAnalyses>();
   PA.preserve<DominatorTreeAnalysis>();
-  PA.preserve<LazyValueAnalysis>();
-  PA.preserve<jeandle::JavaTypeAnalysis>();
   return PA;
 }

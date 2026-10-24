@@ -15,7 +15,7 @@
 ; PEA-ON: function(recover-type-info),
 ; PEA-ON: function(type-check-elimination),
 ; PEA-ON: function(repeated-constant-field-folding),
-; PEA-ON: {{.*function\(arraycopy-specialization\),}}
+; PEA-ON: {{.*function\(copy-specialization\),}}
 ; PEA-ON: function(type-check-elimination),
 ; PEA-ON: {{.*function\(insert-gc-barriers\),}}
 ; PEA-ON: {{.*java-operation-lower\<phase=1\>,}}
@@ -28,7 +28,7 @@
 ; PEA-OFF: function(recover-type-info),
 ; PEA-OFF: function(type-check-elimination),
 ; PEA-OFF: function(repeated-constant-field-folding),
-; PEA-OFF: {{.*function\(arraycopy-specialization\),}}
+; PEA-OFF: {{.*function\(copy-specialization\),}}
 ; PEA-OFF: {{.*function\(type-check-elimination\),}}
 ; PEA-OFF: {{.*function\(insert-gc-barriers\),}}
 ; PEA-OFF: {{.*java-operation-lower\<phase=1\>,}}

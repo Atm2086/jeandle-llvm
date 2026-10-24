@@ -1,10 +1,14 @@
 ; RUN: opt -S --jeandle -jeandle-vm-callback-log=%S/Inputs/osr-char-arraycopy-e2e.cblog %s 2>&1 | FileCheck %s
+; RUN: opt -S -verify-each --jeandle -mattr=+avx512bw,+avx512vl -jeandle-vm-callback-log=%S/Inputs/osr-char-arraycopy-e2e.cblog %s 2>&1 | FileCheck %s --check-prefix=MASKED
+; REQUIRES: x86-registered-target
+; MASKED: call <16 x i16> @llvm.masked.load
+; MASKED: call void @llvm.masked.store
 ;
 ; End-to-end replay of a real pre-optimization dump of an OSR compilation of
 ; TestArrayCopyOSR.copyLoop (char[] locals arrive as naked OSR-buffer loads;
 ; the OSR-entry checkcast chain is phase-0 expanded and dissolved by the
 ; pipeline). The edge-facts engine must recover the char[] element type so
-; ArrayCopySpecialization selects the jshort disjoint stub and the generic
+; CopySpecialization selects the jshort disjoint stub and the generic
 ; stub is dead.
 ;
 ; CHECK-NOT: StubRoutines_generic_arraycopy
@@ -377,7 +381,7 @@ declare hotspotcc ptr addrspace(1) @new_array(ptr, i32, ptr)
 
 declare hotspotcc void @SharedRuntime_register_finalizer(ptr, ptr addrspace(1))
 
-declare hotspotcc void @jeandle.arraycopy(ptr addrspace(1), i32, ptr addrspace(1), i32, i32, ptr, ptr, i32, i32) #6
+declare hotspotcc void @jeandle.copy(ptr addrspace(1), i32, ptr addrspace(1), i32, i32, ptr, ptr, i32, i32) #6
 
 declare hotspotcc void @SharedRuntime_complete_monitor_locking_C(ptr addrspace(1), ptr, ptr)
 
@@ -1405,7 +1409,7 @@ arraycopy_guard_fast17:                           ; preds = %arraycopy_guard_fas
   %arraycopy_klass19 = call hotspotcc ptr @jeandle.load_klass(ptr addrspace(1) %2)
   %25 = call hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %1)
   %26 = call hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %2)
-  invoke hotspotcc void @jeandle.arraycopy(ptr addrspace(1) %1, i32 0, ptr addrspace(1) %2, i32 0, i32 %17, ptr %arraycopy_klass18, ptr %arraycopy_klass19, i32 %25, i32 %26) #13 [ "deopt"(i64 0, i32 13, i32 13, i64 12, ptr addrspace(1) %1, i64 4294967308, ptr addrspace(1) %2, i64 8589934602, i32 %3, i64 12884901898, i32 %4, i64 327695, ptr %OrigPcSlot) ]
+  invoke hotspotcc void @jeandle.copy(ptr addrspace(1) %1, i32 0, ptr addrspace(1) %2, i32 0, i32 %17, ptr %arraycopy_klass18, ptr %arraycopy_klass19, i32 %25, i32 %26) #13 [ "deopt"(i64 0, i32 13, i32 13, i64 12, ptr addrspace(1) %1, i64 4294967308, ptr addrspace(1) %2, i64 8589934602, i32 %3, i64 12884901898, i32 %4, i64 327695, ptr %OrigPcSlot) ]
           to label %bci_13_normal_dest unwind label %bci_13_unwind_dest
 
 bci_13_unwind_dest:                               ; preds = %arraycopy_guard_fast17
@@ -1443,7 +1447,7 @@ attributes #9 = { nocallback nofree nosync nounwind willreturn memory(read) }
 attributes #10 = { nocf_check "disable-tail-calls"="true" "java-method"="140563881107680" }
 attributes #11 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }
 attributes #12 = { nounwind "gc-leaf-function" }
-attributes #13 = { "jeandle.arraycopy.kind"="arraycopy" "jeandle.arraycopy.negative-length-guard" "jeandle.arraycopy.validated" }
+attributes #13 = { "jeandle.copy.kind"="arraycopy" "jeandle.copy.negative-length-guard" "jeandle.copy.validated" }
 
 !current-thread = !{!0}
 !stack-pointer = !{!1}

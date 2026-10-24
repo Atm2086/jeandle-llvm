@@ -1,4 +1,4 @@
-//===- ArrayCopySpecialization.h - Jeandle arraycopy lowering ---*- C++ -*-===//
+//===- CopySpecialization.h - Array and instance copies ---------*- C++ -*-===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
@@ -8,18 +8,18 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_TRANSFORMS_JEANDLE_ARRAYCOPY_SPECIALIZATION_H
-#define LLVM_TRANSFORMS_JEANDLE_ARRAYCOPY_SPECIALIZATION_H
+#ifndef LLVM_TRANSFORMS_JEANDLE_COPY_SPECIALIZATION_H
+#define LLVM_TRANSFORMS_JEANDLE_COPY_SPECIALIZATION_H
 
 #include "llvm/IR/PassManager.h"
 
 namespace llvm {
 
-class ArrayCopySpecialization : public PassInfoMixin<ArrayCopySpecialization> {
+class CopySpecialization : public PassInfoMixin<CopySpecialization> {
 public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
 };
 
 } // namespace llvm
 
-#endif // LLVM_TRANSFORMS_JEANDLE_ARRAYCOPY_SPECIALIZATION_H
+#endif // LLVM_TRANSFORMS_JEANDLE_COPY_SPECIALIZATION_H
