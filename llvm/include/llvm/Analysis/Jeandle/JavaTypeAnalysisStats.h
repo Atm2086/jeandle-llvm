@@ -128,6 +128,17 @@ public:
   static bool isRequired() { return true; }
 };
 
+/// Diagnostic-only cache boundary hook for PASS-LOCAL/CROSS-PASS experiments.
+/// It clears a JavaTypeAnalysis result only if one already exists, so it does
+/// not create JavaTypeAnalysis, DT, or LVI and does not change IR or analysis
+/// lifetimes. CROSS-PASS pipelines omit this pass.
+class JavaTypeCacheClearPass
+    : public PassInfoMixin<JavaTypeCacheClearPass> {
+public:
+  LLVM_ABI PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
+  static bool isRequired() { return true; }
+};
+
 /// Module-level statistics printer: prints the process-wide cumulative counters
 /// at the current module processing position. The numbers may include functions
 /// and modules processed earlier; it queries no type, resets no counter and

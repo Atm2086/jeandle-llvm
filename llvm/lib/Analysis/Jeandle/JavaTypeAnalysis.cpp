@@ -161,6 +161,8 @@ JavaType JavaTypeAnalysisResult::getJavaType(Value *V, Instruction *Context) {
   if (Observer) {
     JavaTypeQueryEvent Event;
     Event.Info = Info;
+    Event.QueryValue = V;
+    Event.Context = ContextBB;
     Event.BaseInsertions = Cache.baseSize() - OldBaseEntries;
     Event.ElapsedNanoseconds = elapsedNanoseconds(Start);
     Event.BaseEntries = Cache.baseSize();

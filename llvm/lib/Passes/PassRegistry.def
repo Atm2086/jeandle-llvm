@@ -553,6 +553,8 @@ FUNCTION_PASS("print<domtree>", DominatorTreePrinterPass(errs()))
 FUNCTION_PASS("print<func-properties>", FunctionPropertiesPrinterPass(errs()))
 FUNCTION_PASS("print<java-type-analysis>",
               jeandle::JavaTypeAnalysisPrinterPass(errs()))
+FUNCTION_PASS("jeandle-java-type-cache-boundary",
+              jeandle::JavaTypeCacheClearPass())
 FUNCTION_PASS("print<inline-cost>", InlineCostAnnotationPrinterPass(errs()))
 FUNCTION_PASS("print<lazy-value-info>", LazyValueInfoPrinterPass(errs()))
 FUNCTION_PASS("print<loops>", LoopPrinterPass(errs()))

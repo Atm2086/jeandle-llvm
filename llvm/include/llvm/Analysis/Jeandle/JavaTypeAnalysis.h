@@ -32,6 +32,10 @@ namespace jeandle {
 /// the net number of newly inserted base entries.
 struct JavaTypeQueryEvent {
   CachedJavaTypeQueryInfo Info;
+  /// Top-level query keys. These pointers are valid while the observer runs;
+  /// diagnostic consumers must not retain them across IR mutation.
+  Value *QueryValue = nullptr;
+  BasicBlock *Context = nullptr;
   uint64_t BaseInsertions = 0;
   uint64_t ElapsedNanoseconds = 0;
   size_t BaseEntries = 0;

@@ -28,6 +28,11 @@ cl::opt<bool> CollectJavaTypeStats(
     cl::desc("Collect Java type query and cache statistics"),
     cl::Hidden, cl::init(false));
 
+cl::opt<bool> TraceJavaTypeQueries(
+    "jeandle-java-type-query-trace",
+    cl::desc("Print one diagnostic line per Java type query"),
+    cl::Hidden, cl::init(false));
+
 ALWAYS_ENABLED_STATISTIC(TotalInvalidations, "Java type invalidation requests");
 ALWAYS_ENABLED_STATISTIC(TotalSelectiveInvalidations, "Java type selective invalidations");
 ALWAYS_ENABLED_STATISTIC(TotalCFGInvalidations, "Java type CFG invalidations");
@@ -92,8 +97,26 @@ bool jeandle::javaTypeStatsEnabled() { return CollectJavaTypeStats; }
 void JavaTypeStatsAnalysis::Result::onQuery(const JavaTypeQueryEvent &Event) {
   const CachedJavaTypeQueryInfo &Info = Event.Info;
 
-  ++Stats.Queries;
+  const uint64_t QueryOrdinal = ++Stats.Queries;
   ++TotalQueries;
+
+  if (TraceJavaTypeQueries) {
+    errs() << "JavaTypeQuery function: " << F.getName()
+           << " ordinal: " << QueryOrdinal << " value: ";
+    Event.QueryValue->printAsOperand(errs(), false);
+    errs() << " context: ";
+    if (Event.Context)
+      Event.Context->printAsOperand(errs(), false);
+    else
+      errs() << "<base>";
+    errs() << " base_hits: " << Info.BaseHits
+           << " base_misses: " << Info.BaseMisses
+           << " facts_hits: " << Info.FactsHits
+           << " facts_misses: " << Info.FactsMisses
+           << " final_hits: " << Info.FinalHits
+           << " final_misses: " << Info.FinalMisses
+           << " base_insertions: " << Event.BaseInsertions << '\n';
+  }
 
   Stats.BaseHits += Info.BaseHits;
   Stats.BaseMisses += Info.BaseMisses;
@@ -261,6 +284,18 @@ JavaTypeAnalysisPrinterPass::run(Function &F, FunctionAnalysisManager &FAM) {
 /// Prints the process-wide cumulative counters at the module processing
 /// position; the numbers include functions and modules processed earlier. It
 /// resets no counter, modifies no IR and triggers no Java type query.
+PreservedAnalyses
+JavaTypeCacheClearPass::run(Function &F, FunctionAnalysisManager &FAM) {
+  auto *Result = FAM.getCachedResult<JavaTypeAnalysis>(F);
+  if (CollectJavaTypeStats)
+    errs() << "JavaTypeCacheBoundary function: " << F.getName()
+           << " existing_analysis=" << (Result ? 1 : 0)
+           << " action=" << (Result ? "clear" : "none") << '\n';
+  if (Result)
+    Result->clear();
+  return PreservedAnalyses::all();
+}
+
 PreservedAnalyses
 JavaTypeAnalysisSummaryPrinterPass::run(Module &M, ModuleAnalysisManager &) {
   OS << "JavaTypeAnalysis process summary after module: " << M.getName() << '\n';
