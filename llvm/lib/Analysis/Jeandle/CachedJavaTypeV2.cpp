@@ -1,4 +1,4 @@
-//===- JavaType.cpp - Java Type Query Implementation ----------------------===//
+//===- CachedJavaTypeV2.cpp - Cached Java Type Queries ----------------------===//
 //
 // Copyright (c) 2025, the Jeandle-LLVM Authors. All Rights Reserved.
 //
@@ -8,7 +8,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/IR/Jeandle/JavaType.h"
+#include "llvm/Analysis/Jeandle/CachedJavaTypeV2.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -31,140 +31,69 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
-#define DEBUG_TYPE "java-type"
+#define DEBUG_TYPE "cached-java-type-v2"
 
 using namespace llvm;
 using namespace llvm::jeandle;
 
-STATISTIC(NumJavaTypeBudgetExhausted,
-          "Number of edge-facts queries that hit the per-query join budget");
+STATISTIC(NumCachedJavaTypeV2BudgetExhausted,
+          "Number of V2 edge-facts queries that hit the per-query join budget");
+
+// The private query implementation below is copied from JavaType.cpp at
+// 86be908ea. Cache-specific state and entry-point changes stay in this file;
+// the original engine is unchanged. JavaType and its public operations,
+// identity/klass helpers and sharpen keep their original implementations.
+// Future query algorithm fixes must be reviewed for both engines.
+
+JavaTypeCacheInvalidationInfo
+JavaTypeCacheV2::invalidate(ArrayRef<Value *> Changed) {
+  JavaTypeCacheInvalidationInfo Info;
+  const size_t OldSize = BaseTypes.size();
+  if (OldSize == 0)
+    return Info;
+
+  // The old SSA use graph is a conservative superset of both type and
+  // definedness dependencies. In particular, do not stop at non-pointer
+  // instructions or at values that have no entry in BaseTypes.
+  constexpr unsigned MaxInvalidationValues = 4096;
+  constexpr unsigned MaxInvalidationUses = 4 * MaxInvalidationValues;
+  SmallPtrSet<Value *, 32> Affected;
+  SmallVector<Value *, 32> Pending(Changed.begin(), Changed.end());
+  while (!Pending.empty()) {
+    Value *V = Pending.pop_back_val();
+    if (!V || !Affected.insert(V).second)
+      continue;
+    ++Info.ValuesVisited;
+    if (Info.ValuesVisited > MaxInvalidationValues ||
+        !isa<Instruction, Argument>(V)) {
+      Info.FullClear = true;
+      break;
+    }
+    for (User *U : V->users()) {
+      if (++Info.UsesVisited > MaxInvalidationUses) {
+        Info.FullClear = true;
+        break;
+      }
+      Pending.push_back(U);
+    }
+    if (Info.FullClear)
+      break;
+  }
+
+  if (Info.FullClear)
+    clear();
+  else
+    for (Value *V : Affected)
+      BaseTypes.erase(V);
+  Info.BaseRemoved = OldSize - BaseTypes.size();
+  return Info;
+}
 
 // =============================================================================
-// Helpers
+// Private helpers needed by the cached query
 // =============================================================================
-
-/// Maximum recursion depth for extractKlassConstantImpl.
-/// Prevents infinite recursion on deeply nested or cyclic IR patterns.
-static constexpr unsigned MaxExtractKlassDepth = 16;
-
-/// Pointer wrappers do not establish which definition supplies an interposable
-/// alias. Only aliases with a definitive local target may be followed.
-static Value *stripKlassPointerWrappers(Value *V) {
-  SmallPtrSet<Value *, 8> Visited;
-  while (Visited.insert(V).second) {
-    V = V->stripPointerCasts();
-    auto *Alias = dyn_cast<GlobalAlias>(V);
-    if (!Alias || Alias->isInterposable())
-      return V;
-    V = Alias->getAliasee();
-  }
-  return V;
-}
-
-static uintptr_t extractKlassConstantImpl(Value *V, unsigned Depth) {
-  if (Depth > MaxExtractKlassDepth)
-    return 0;
-
-  // A freeze preserves its operand's Klass only when the operand is defined.
-  if (auto *FI = dyn_cast<FreezeInst>(V))
-    return isProvenDefined(FI->getOperand(0))
-               ? extractKlassConstantImpl(FI->getOperand(0), Depth + 1)
-               : 0;
-
-  // Strip pointer casts (bitcast, addrspacecast, zero-index GEP) and
-  // aliases to see through wrappers that optimization passes may introduce.
-  V = stripKlassPointerWrappers(V);
-
-  // Pattern 1: inttoptr instruction.
-  if (auto *I2P = dyn_cast<IntToPtrInst>(V)) {
-    Value *Src = I2P->getOperand(0);
-
-    // Pattern B: look through zext/sext on the inttoptr operand.
-    // Klass pointers are always positive (high bit zero), so zext/sext
-    // from a narrower type preserves the value. TruncInst is NOT safe
-    // because truncation can change the klass value.
-    if (auto *Cast = dyn_cast<CastInst>(Src)) {
-      if (isa<ZExtInst>(Cast) || isa<SExtInst>(Cast))
-        Src = Cast->getOperand(0);
-    }
-
-    if (auto *CI = dyn_cast<ConstantInt>(Src))
-      return CI->getZExtValue();
-    // Handle inttoptr(ptrtoint(V)) chains — strip the round-trip and recurse.
-    if (auto *P2I = dyn_cast<PtrToIntInst>(Src))
-      return extractKlassConstantImpl(P2I->getPointerOperand(), Depth + 1);
-    if (auto *CE = dyn_cast<ConstantExpr>(Src)) {
-      if (CE->getOpcode() == Instruction::PtrToInt)
-        return extractKlassConstantImpl(CE->getOperand(0), Depth + 1);
-      // Handle zext/sext ConstantExpr wrapping a PtrToInt.
-      if ((CE->getOpcode() == Instruction::ZExt ||
-           CE->getOpcode() == Instruction::SExt) &&
-          CE->getNumOperands() > 0) {
-        auto *Inner = dyn_cast<ConstantExpr>(CE->getOperand(0));
-        if (Inner && Inner->getOpcode() == Instruction::PtrToInt)
-          return extractKlassConstantImpl(Inner->getOperand(0), Depth + 1);
-      }
-    }
-  }
-  // Pattern 2: inttoptr constant expression.
-  if (auto *CE = dyn_cast<ConstantExpr>(V)) {
-    if (CE->getOpcode() == Instruction::IntToPtr) {
-      Value *Src = CE->getOperand(0);
-
-      // Pattern B: look through zext/sext ConstantExpr.
-      if (auto *InnerCE = dyn_cast<ConstantExpr>(Src)) {
-        if (InnerCE->getOpcode() == Instruction::ZExt ||
-            InnerCE->getOpcode() == Instruction::SExt)
-          Src = InnerCE->getOperand(0);
-      }
-
-      if (auto *CI = dyn_cast<ConstantInt>(Src))
-        return CI->getZExtValue();
-      // Handle inttoptr(ptrtoint(V)) constant expression chain.
-      if (auto *InnerCE = dyn_cast<ConstantExpr>(Src)) {
-        if (InnerCE->getOpcode() == Instruction::PtrToInt)
-          return extractKlassConstantImpl(InnerCE->getOperand(0), Depth + 1);
-      }
-    }
-  }
-  // Pattern 3: load from a constant global variable (recurse into initializer).
-  if (auto *LI = dyn_cast<LoadInst>(V)) {
-    if (auto *GV = dyn_cast<GlobalVariable>(
-            stripKlassPointerWrappers(LI->getPointerOperand()))) {
-      if (GV->isConstant() && GV->hasDefinitiveInitializer())
-        return extractKlassConstantImpl(GV->getInitializer(), Depth + 1);
-    }
-  }
-  // Pattern 4: bare ConstantInt — only reachable via recursion from pattern 3
-  // (e.g., @klass = constant i64 12345). Cannot appear as a direct ptr argument
-  // to check_instanceof because LLVM enforces type safety.
-  if (auto *CI = dyn_cast<ConstantInt>(V))
-    return CI->getZExtValue();
-
-  return 0;
-}
-
-uintptr_t jeandle::extractKlassConstant(Value *V) {
-  return extractKlassConstantImpl(V, 0);
-}
-
-bool jeandle::areKlassesIncompatible(uintptr_t Klass, bool KlassExact,
-                                     uintptr_t OtherKlass) {
-  const VMCallbacks *CB = getVMCallbacks();
-  assert(CB && CB->IsSubtype && CB->IsInterface && "VMCallbacks must be set");
-  if (CB->IsSubtype(Klass, OtherKlass) || CB->IsInterface(Klass))
-    return false;
-  if (KlassExact)
-    return true;
-  if (CB->IsSubtype(OtherKlass, Klass) || CB->IsInterface(OtherKlass))
-    return false;
-  // Arrays of interfaces can overlap with unrelated array bounds through
-  // covariant element subtypes. The verifier classification includes both
-  // interfaces themselves and arrays with an interface base element.
-  return CB->IsUnverifiedInterface && !CB->IsUnverifiedInterface(Klass) &&
-         !CB->IsUnverifiedInterface(OtherKlass);
-}
 
 /// Return true if F is jeandle.check_instanceof.
 static bool isCheckInstanceofFn(const Function *F) {
@@ -243,29 +172,6 @@ static void unionExcludedKlasses(SmallDenseSet<uintptr_t, 2> &Dst,
     addExcludedKlass(Dst, K);
 }
 
-/// Enforce ExcludedKlasses invariants:
-/// 1. If Exact, clear ExcludedKlasses (type is fully determined).
-/// 2. Remove exclusions already implied by an incompatible positive bound.
-///    Interfaces and covariant arrays may overlap without either bound being
-///    a subtype of the other, so absence of a subtype relation is insufficient.
-static void normalizeExcludedKlasses(JavaType &T) {
-  if (T.ExcludedKlasses.empty())
-    return;
-  if (T.Exact) {
-    T.ExcludedKlasses.clear();
-    return;
-  }
-  if (T.Klass != 0) {
-    SmallVector<uintptr_t, 2> ToRemove;
-    for (uintptr_t K : T.ExcludedKlasses) {
-      if (areKlassesIncompatible(T.Klass, T.Exact, K))
-        ToRemove.push_back(K);
-    }
-    for (uintptr_t K : ToRemove)
-      T.ExcludedKlasses.erase(K);
-  }
-}
-
 static SmallDenseSet<uintptr_t, 2>
 getFullInterfaces(uintptr_t Klass,
                   const SmallDenseSet<uintptr_t, 2> &PartialInterfaces) {
@@ -299,137 +205,6 @@ getFullInterfaces(uintptr_t Klass,
   return Result;
 }
 
-jeandle::JavaType::JavaType(uintptr_t Klass, bool Exact)
-    : Klass(Klass), Exact(Exact) {
-  this->Interfaces = getFullInterfaces(Klass, {});
-}
-
-JavaType jeandle::typeUnion(JavaType A, JavaType B) {
-  JavaType Result;
-  for (uintptr_t I : A.Interfaces) {
-    if (B.Interfaces.contains(I)) {
-      Result.Interfaces.insert(I);
-    }
-  }
-  if (A.Klass == 0 && B.Klass == 0) {
-    // Both have unknown positive type. Intersect exclusions.
-    if (!A.ExcludedKlasses.empty() && !B.ExcludedKlasses.empty())
-      Result.ExcludedKlasses =
-          intersectExcludedKlasses(A.ExcludedKlasses, B.ExcludedKlasses);
-    return Result;
-  }
-  if (A.Klass == 0 || B.Klass == 0) {
-    // One known Klass, one unknown. Ensure A has the known Klass.
-    if (A.Klass == 0)
-      std::swap(A, B);
-    // Drop positive type (value could come from the unknown side).
-    // Preserve exclusions from B that are also excluded by A's knowledge.
-    if (!B.ExcludedKlasses.empty()) {
-      for (uintptr_t E : B.ExcludedKlasses) {
-        // E is excluded on B's path (explicit). Check A's path:
-        // either A explicitly excludes E, or A's class type makes E impossible.
-        if (isExcludedBy(E, A.ExcludedKlasses) ||
-            areKlassesIncompatible(A.Klass, A.Exact, E)) {
-          addExcludedKlass(Result.ExcludedKlasses, E);
-        }
-      }
-    }
-    return Result;
-  }
-  if (A.Klass == B.Klass) {
-    Result.Klass = A.Klass;
-    Result.Exact = A.Exact && B.Exact;
-  } else {
-    const VMCallbacks *CB = getVMCallbacks();
-    assert(CB && CB->GetCommonSuperKlass && "VMCallbacks must be set");
-    uintptr_t LCA = CB->GetCommonSuperKlass(A.Klass, B.Klass);
-    // No common superclass: the positive type is unknown, but the already
-    // computed Interfaces intersection and the exclusion merge below remain
-    // the honest join — they are not discarded. (HotSpot's LCA walk reaches
-    // java.lang.Object from any pair, so this branch is defensive.)
-    if (LCA == 0) {
-      Result.Klass = 0;
-      Result.Exact = false;
-    } else {
-      Result.Klass = LCA;
-      Result.Exact = false;
-    }
-  }
-  // An exclusion common to both arms can be explicit on one side and implied
-  // by the positive bound on the other. Examine candidates from both arms.
-  auto Excludes = [](const JavaType &T, uintptr_t K) {
-    return isExcludedBy(K, T.ExcludedKlasses) ||
-           (T.isKnown() && areKlassesIncompatible(T.Klass, T.Exact, K));
-  };
-  for (const JavaType *T : {&A, &B})
-    for (uintptr_t K : T->ExcludedKlasses)
-      if (Excludes(A, K) && Excludes(B, K))
-        addExcludedKlass(Result.ExcludedKlasses, K);
-  normalizeExcludedKlasses(Result);
-  return Result;
-}
-
-JavaType jeandle::typeIntersect(JavaType A, JavaType B) {
-  JavaType Result;
-  for (uintptr_t I : A.Interfaces) {
-    Result.Interfaces.insert(I);
-  }
-  for (uintptr_t I : B.Interfaces) {
-    Result.Interfaces.insert(I);
-  }
-  // Positive type: pick the more specific one.
-  if (A.isKnown() && B.isKnown()) {
-    const VMCallbacks *CB = getVMCallbacks();
-    assert(CB && CB->IsSubtype && "VMCallbacks must be set");
-    if (A.Klass == B.Klass) {
-      // Equal klass: Exact is conjunctive. Exact=true is the stricter claim
-      // ("value is exactly this class"), so if either operand is exact the
-      // intersection is exact. IsSubtype is reflexive, so without this case
-      // the first branch below would win and silently drop the other side's
-      // Exact. (Dual of typeUnion's A.Exact && B.Exact for the equal case.)
-      Result.Klass = A.Klass;
-      Result.Exact = A.Exact || B.Exact;
-    } else if (A.Exact != B.Exact) {
-      // Exactly one side is Exact: an exact claim is a complete dynamic-type
-      // claim (allocation type, constant oop's runtime klass, or a final
-      // klass proven by a passing check), so the exact side is always at
-      // least as strong as anything the other side could contribute. When the
-      // two sides are also inconsistent (no common subtype — only reachable
-      // with different klasses here), no live value satisfies both claims and
-      // the program point is dead, so keeping the exact side is vacuously
-      // sound there and avoids needlessly degrading to unknown.
-      Result.Klass = A.Exact ? A.Klass : B.Klass;
-      Result.Exact = true;
-    } else if (CB->IsSubtype(A.Klass, B.Klass)) {
-      Result.Klass = A.Klass;
-      Result.Exact = A.Exact;
-    } else if (CB->IsSubtype(B.Klass, A.Klass)) {
-      Result.Klass = B.Klass;
-      Result.Exact = B.Exact;
-    } else if (CB->IsInterface(A.Klass) != CB->IsInterface(B.Klass)) {
-      // A concrete class bound and an unrelated interface can both hold for
-      // a subclass. Preserve the class while Interfaces carries the other
-      // constraint independently.
-      Result.Klass = CB->IsInterface(A.Klass) ? B.Klass : A.Klass;
-    }
-    // Other unrelated bounds need not have a representable intersection;
-    // retain their common interface constraints without inventing a Klass.
-  } else if (A.isKnown()) {
-    Result.Klass = A.Klass;
-    Result.Exact = A.Exact;
-  } else if (B.isKnown()) {
-    Result.Klass = B.Klass;
-    Result.Exact = B.Exact;
-  }
-
-  // Negative constraints: union (both exclusions apply at the same point).
-  Result.ExcludedKlasses = A.ExcludedKlasses;
-  unionExcludedKlasses(Result.ExcludedKlasses, B.ExcludedKlasses);
-  normalizeExcludedKlasses(Result);
-
-  return Result;
-}
-
 // =============================================================================
 // Context-insensitive type query
 // =============================================================================
@@ -437,33 +212,46 @@ JavaType jeandle::typeIntersect(JavaType A, JavaType B) {
 /// Complete context-insensitive types, independent of the query point.
 /// An absorbing unknown input can complete a query early; other cyclic
 /// dependencies are cached only after the whole SCC has been evaluated.
-using BaseMemo = DenseMap<Value *, JavaType>;
+using BaseMemo = JavaTypeBaseMemo;
 using DefinedMemo = DenseMap<Value *, bool>;
 
-/// Follow one pointer identity expression. Explicit type seeds are separate
-/// constraints on the result, rather than a reason to discard this dependency.
-Value *jeandle::getJavaIdentityInput(Value *V) {
-  if (!V->getType()->isPointerTy())
-    return nullptr;
-  if (auto *GEP = dyn_cast<GEPOperator>(V))
-    return GEP->hasAllZeroIndices() ? GEP->getPointerOperand() : nullptr;
-  if (auto *Alias = dyn_cast<GlobalAlias>(V)) {
-    // Pointer wrappers do not establish which definition supplies an
-    // interposable alias (same rule as stripKlassPointerWrappers): only an
-    // alias with a definitive target may forward the aliasee's type.
-    return Alias->isInterposable() ? nullptr : Alias->getAliasee();
+namespace {
+
+/// Query-local observations, not solver state or a second result cache.
+struct BaseQueryState {
+  BaseMemo &Cache;
+  CachedJavaTypeQueryInfo &Info;
+  JavaTypeCacheV2Diagnostics *Diagnostics;
+  SmallPtrSet<Value *, 32> PriorKeys;
+  size_t InitialSize;
+
+  BaseQueryState(BaseMemo &Cache, CachedJavaTypeQueryInfo &Info,
+                 JavaTypeCacheV2Diagnostics *Diagnostics)
+      : Cache(Cache), Info(Info), Diagnostics(Diagnostics),
+        InitialSize(Cache.size()) {
+    if (Diagnostics) {
+      *Diagnostics = {};
+      for (const auto &Entry : Cache)
+        PriorKeys.insert(Entry.first);
+    }
   }
-  if (auto *CB = dyn_cast<CallBase>(V)) {
-    if (CB->getIntrinsicID() == Intrinsic::launder_invariant_group ||
-        CB->getIntrinsicID() == Intrinsic::strip_invariant_group)
-      return CB->getArgOperand(0);
-    return CB->getReturnedArgOperand();
+
+  ~BaseQueryState() {
+    if (Diagnostics)
+      Diagnostics->EntriesAdded = Cache.size() - InitialSize;
   }
-  if (Operator::getOpcode(V) == Instruction::BitCast ||
-      Operator::getOpcode(V) == Instruction::AddrSpaceCast)
-    return cast<User>(V)->getOperand(0);
-  return nullptr;
-}
+
+  void hit(Value *V) {
+    if (Diagnostics) {
+      if (PriorKeys.contains(V))
+        ++Diagnostics->PriorQueryHits;
+      else
+        ++Diagnostics->CurrentQueryHits;
+    }
+  }
+};
+
+} // namespace
 
 /// The inputs whose types bound V. Identity expressions participate in the
 /// same dependency graph as PHIs and selects, including when nested in cycles.
@@ -642,11 +430,6 @@ static bool isProvenDefined(Value *V, DefinedMemo &Memo) {
   return Memo.lookup(V);
 }
 
-bool jeandle::isProvenDefined(Value *V) {
-  DefinedMemo Memo;
-  return ::isProvenDefined(V, Memo);
-}
-
 /// Join one more arm into an accumulator where the first arm seeds it:
 /// typeUnion treats unknown as absorbing (typeUnion({}, X) == {}), so the
 /// first arm must seed the accumulator rather than union into an empty one.
@@ -761,13 +544,24 @@ struct BaseTypeNode {
 /// forwards a type that comes with a definedness proof. Neither traversal
 /// uses the C++ call stack.
 static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
-                                DefinedMemo *Defined = nullptr) {
+                                DefinedMemo *Defined = nullptr,
+                                BaseQueryState *State = nullptr) {
   BaseMemo LocalMemo;
   BaseMemo &Cache = Memo ? *Memo : LocalMemo;
-  if (auto It = Cache.find(V); It != Cache.end())
+  auto *Diagnostics = State ? State->Diagnostics : nullptr;
+  if (auto It = Cache.find(V); It != Cache.end()) {
+    if (State) {
+      ++State->Info.BaseHits;
+      State->hit(V);
+    }
     return It->second;
+  }
+  if (State)
+    ++State->Info.BaseMisses;
   SmallVector<Value *, 2> Inputs;
   if (!getBaseTypeInputs(V, Inputs, /*SkipVacuousArms=*/true)) {
+    if (Diagnostics)
+      ++Diagnostics->NodesEvaluated;
     JavaType Result = getBaseJavaTypeLeaf(V);
     Cache[V] = Result;
     return Result;
@@ -781,6 +575,8 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
   SmallVector<BaseTypeNode *, 16> Roots;
   unsigned NextIndex = 0;
   auto Discover = [&](Value *Input) {
+    if (Diagnostics)
+      ++Diagnostics->NodesEvaluated;
     auto N = std::make_unique<BaseTypeNode>();
     N->V = Input;
     N->Index = NextIndex++;
@@ -821,9 +617,17 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
     }
     if (N->NextInput != N->Inputs.size()) {
       Value *Input = N->Inputs[N->NextInput++];
+      if (Diagnostics)
+        ++Diagnostics->InputEdgesVisited;
       if (Cache.contains(Input)) {
+        if (Diagnostics)
+          ++Diagnostics->InputHits;
+        if (State)
+          State->hit(Input);
         JoinInput(N, Input);
       } else if (auto It = Nodes.find(Input); It != Nodes.end()) {
+        if (Diagnostics)
+          ++Diagnostics->OpenNodeEdges;
         BaseTypeNode *InputNode = It->second.get();
         assert(InputNode->OnStack && "completed input must be cached");
         // Merge the component roots joined by this edge, including a cross
@@ -831,6 +635,8 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
         while (Roots.back()->Index > InputNode->Index)
           Roots.pop_back();
       } else {
+        if (Diagnostics)
+          ++Diagnostics->InputMisses;
         N->PendingChild = Discover(Input);
       }
       continue;
@@ -861,6 +667,8 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
       Cache[N->V] = Result;
       continue;
     }
+    if (Diagnostics)
+      ++Diagnostics->CyclicSCCs;
     // Every member of a cycle derives its values from the completed inputs
     // entering the cycle — PHI and select only choose among their operands —
     // so all defined observations of any member stay inside the join of
@@ -897,6 +705,8 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
         Users[Input].push_back(M);
     }
     while (!Pending.empty()) {
+      if (Diagnostics)
+        ++Diagnostics->RefinementSteps;
       BaseTypeNode *M = Pending.pop_back_val();
       Queued.erase(M);
       JavaType Derived;
@@ -930,9 +740,14 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
 /// exceeding frames contribute an empty (unknown) fact and are not memoized.
 /// Hidden tuning knob: large methods with joins deeper than the default lose
 /// check-derived sharpening (sound, precision-only) and can raise this.
-static cl::opt<unsigned> MaxFactsJoinBlocks(
-    "jeandle-max-facts-join-blocks", cl::init(128), cl::Hidden,
-    cl::desc("Maximum joined blocks per JavaType query dimension"));
+// The original engine owns this option. Read it for each query without
+// modifying that engine or registering a duplicate command-line option.
+static unsigned getFactsJoinBudget() {
+  auto *Option =
+      cl::getRegisteredOptions().lookup("jeandle-max-facts-join-blocks");
+  assert(Option && "the original JavaType query option must be registered");
+  return static_cast<cl::opt<unsigned> *>(Option)->getValue();
+}
 
 namespace {
 
@@ -940,16 +755,15 @@ namespace {
 /// conditions, the null-edge oracle and VM callbacks, so they are constant
 /// for the lifetime of one query and safely memoized here.
 ///
-/// The memo's lifetime is deliberately one top-level query, not one pass:
-/// within a query it turns the exponential path join into a linear one, while
-/// consumers amortize across queries with their own result caches
-/// (RecoverTypeInfo's per-load and per-edge caches). A pass-scoped memo would
-/// additionally need invalidation discipline for every consumer that erases
-/// instructions mid-pass (ConstantFieldFolding does), where dangling Value*
-/// keys could alias freshly allocated values and return stale facts.
+/// This V2-local context borrows BaseTypes and optional completed edge results
+/// from the caller. Definedness proofs, block/value memos, recursion state and
+/// budgets remain local. The caller maintains the two caches independently.
 struct JavaTypeQueryContext {
-  JavaTypeQueryContext(DominatorTree &DT, IsNullEdgeOracle NullOracle)
-      : DT(DT), NullOracle(NullOracle) {}
+  JavaTypeQueryContext(DominatorTree &DT, IsNullEdgeOracle NullOracle,
+                       BaseMemo &BaseTypes, BaseQueryState &BaseState,
+                       JavaTypeFactsCacheV2 *FactsCache = nullptr)
+      : DT(DT), NullOracle(NullOracle), BaseTypes(BaseTypes),
+        BaseState(BaseState), FactsCache(FactsCache) {}
 
   DominatorTree &DT;
   IsNullEdgeOracle NullOracle;
@@ -957,8 +771,10 @@ struct JavaTypeQueryContext {
   /// re-encountered PHI contributes nothing. Base-type queries detect
   /// cycles with their own SCC state and do not use this set.
   SmallPtrSet<const PHINode *, 8> PhiVisited;
-  /// Complete base-type memo shared across the whole query (see BaseMemo).
-  BaseMemo BaseTypes;
+  /// Complete base-type memo owned by the caller (see BaseMemo).
+  BaseMemo &BaseTypes;
+  BaseQueryState &BaseState;
+  JavaTypeFactsCacheV2 *FactsCache;
   /// Completed value-dimension results. Nested PHIs can depend on the active
   /// PHI stack, so only evaluations outside that stack enter this cache.
   DenseMap<Value *, JavaType> ValueTypes;
@@ -972,12 +788,22 @@ struct JavaTypeQueryContext {
   /// container for both memoization and cycle detection keeps the two from
   /// drifting apart across exit paths.
   DenseMap<std::pair<Value *, BasicBlock *>, std::optional<JavaType>> Processed;
-  unsigned FactsBudget = MaxFactsJoinBlocks;
-  unsigned PhiBudget = MaxFactsJoinBlocks;
+  unsigned FactsBudget = getFactsJoinBudget();
+  unsigned PhiBudget = getFactsJoinBudget();
   unsigned ConditionDepth = 0;
 };
 
 } // namespace
+
+// Keep mutable cache storage private without exposing the query context or
+// implementation helpers in the public header.
+namespace llvm::jeandle {
+struct JavaTypeFactsCacheV2Access {
+  static auto &nullEdges(JavaTypeFactsCacheV2 &C) { return C.NullEdges; }
+  static auto &guards(JavaTypeFactsCacheV2 &C) { return C.Guards; }
+  static auto &stats(JavaTypeFactsCacheV2 &C) { return C.Counters; }
+};
+} // namespace llvm::jeandle
 
 /// Check if IncomingBB is reached only when Obj is null.
 /// Walks up the dominator tree from IncomingBB looking for a conditional branch
@@ -1030,8 +856,8 @@ static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
 /// with a structural fallback for threaded shapes the oracle misses: null
 /// tests on casted pointers and with the null constant on either operand
 /// side. When in doubt the answer is false — keeping an edge is always sound.
-static bool isNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
-                       const JavaTypeQueryContext &Q) {
+static bool computeNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
+                            const JavaTypeQueryContext &Q) {
   if (!Q.DT.isReachableFromEntry(From))
     return false; // Lattice reasoning is undefined for unreachable blocks;
                   // keep the edge (the conservative answer).
@@ -1041,6 +867,34 @@ static bool isNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
   // every edge out of From, including this one: V is an SSA value, so its
   // null-ness cannot change inside the block.
   return isNullCheckPath(From, V, Q.DT);
+}
+
+static bool isNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
+                       const JavaTypeQueryContext &Q) {
+  auto *C = Q.FactsCache;
+  if (!C)
+    return computeNullEdge(V, From, To, Q);
+  assert(C->getFunction() == From->getParent() &&
+         C->getFunction() == To->getParent() && "wrong facts cache owner");
+  auto &S = JavaTypeFactsCacheV2Access::stats(*C);
+  ++S.NullRequests;
+  if (C->getMode() == JavaTypeFactsCacheV2::Mode::GuardOnly) {
+    ++S.NullComputed;
+    return computeNullEdge(V, From, To, Q);
+  }
+
+  // Preserve the raw value identity of this helper. Its canonicalization is
+  // different from edgeGuard's and must not be folded into a shared key.
+  JavaTypeFactsCacheV2::Key K{V, {From, To}};
+  auto &Memo = JavaTypeFactsCacheV2Access::nullEdges(*C);
+  if (auto It = Memo.find(K); It != Memo.end()) {
+    ++S.NullHits;
+    return It->second;
+  }
+  ++S.NullComputed;
+  bool Result = computeNullEdge(V, From, To, Q);
+  Memo.try_emplace(K, Result);
+  return Result;
 }
 
 // Condition tracing: trace from a branch condition to a check_instanceof call
@@ -1932,8 +1786,8 @@ traceSideToFacts(uintptr_t Klass, const SmallDenseSet<uintptr_t, 2> &Interfaces,
 /// information. For a switch, an edge reached through exactly one case value
 /// (or through the default when exactly one pair value is cased elsewhere)
 /// pins the condition to that value. Other terminators carry no guard.
-static JavaType edgeGuard(BasicBlock *From, BasicBlock *To, Value *V,
-                          JavaTypeQueryContext &Q) {
+static JavaType computeEdgeGuard(BasicBlock *From, BasicBlock *To, Value *V,
+                                 JavaTypeQueryContext &Q) {
   // Same canonicalization as the trace entry, so a guard on a frozen or
   // identity-wrapped oop constrains the underlying object's type query.
   V = stripCastsAndFreeze(V->stripPointerCastsAndAliases(), Q.DefinedValues);
@@ -2043,6 +1897,34 @@ static JavaType edgeGuard(BasicBlock *From, BasicBlock *To, Value *V,
   return {};
 }
 
+static JavaType edgeGuard(BasicBlock *From, BasicBlock *To, Value *V,
+                          JavaTypeQueryContext &Q) {
+  auto *C = Q.FactsCache;
+  if (!C)
+    return computeEdgeGuard(From, To, V, Q);
+  assert(C->getFunction() == From->getParent() &&
+         C->getFunction() == To->getParent() && "wrong facts cache owner");
+  auto &S = JavaTypeFactsCacheV2Access::stats(*C);
+  ++S.GuardRequests;
+  // Only a root trace starts with the full condition-depth allowance. A
+  // nested trace must neither consume nor publish a root result.
+  if (Q.ConditionDepth != 0) {
+    ++S.GuardBypasses;
+    ++S.GuardComputed;
+    return computeEdgeGuard(From, To, V, Q);
+  }
+  JavaTypeFactsCacheV2::Key K{V, {From, To}};
+  auto &Memo = JavaTypeFactsCacheV2Access::guards(*C);
+  if (auto It = Memo.find(K); It != Memo.end()) {
+    ++S.GuardHits;
+    return It->second;
+  }
+  ++S.GuardComputed;
+  JavaType Result = computeEdgeGuard(From, To, V, Q);
+  Memo.try_emplace(K, Result);
+  return Result;
+}
+
 /// Facts holding about V at the top of BB: the join over non-skipped incoming
 /// edges of (facts at the predecessor, narrowed by the edge guard).
 /// Facts-only: check-derived constraints, never attribute/metadata base types.
@@ -2067,7 +1949,7 @@ static JavaType factsAt(Value *V, BasicBlock *BB, JavaTypeQueryContext &Q) {
                // cut (irreducible) — empty contribution to that join arm.
   }
   if (Q.FactsBudget == 0) {
-    ++NumJavaTypeBudgetExhausted;
+    ++NumCachedJavaTypeV2BudgetExhausted;
     LLVM_DEBUG(dbgs() << "JavaType: per-query block budget exhausted at "
                       << BB->getName() << " for " << *V << "\n");
     Q.Processed.erase(It);
@@ -2157,7 +2039,8 @@ static JavaType phiValueType(PHINode *PN, JavaTypeQueryContext &Q) {
 /// edge facts for PHIs and definition-point operand facts for forwarders.
 /// Cycles and exhausted budgets fall back to the complete base bound.
 static JavaType valueDimension(Value *V, JavaTypeQueryContext &Q) {
-  JavaType Base = getBaseJavaType(V, &Q.BaseTypes, &Q.DefinedValues);
+  JavaType Base =
+      getBaseJavaType(V, &Q.BaseTypes, &Q.DefinedValues, &Q.BaseState);
   SmallVector<Value *, 4> Inputs;
   if (!getBaseTypeInputs(V, Inputs, /*SkipVacuousArms=*/true) || Base.Exact)
     return Base;
@@ -2168,7 +2051,7 @@ static JavaType valueDimension(Value *V, JavaTypeQueryContext &Q) {
     return Base;
   }
   if (Q.PhiBudget == 0) {
-    ++NumJavaTypeBudgetExhausted;
+    ++NumCachedJavaTypeV2BudgetExhausted;
     return Base;
   }
   --Q.PhiBudget;
@@ -2197,40 +2080,29 @@ static JavaType valueDimension(Value *V, JavaTypeQueryContext &Q) {
   return Result;
 }
 
-JavaType jeandle::sharpen(Value *V, Instruction *Context, DominatorTree &DT,
-                          BasicBlock *DestBB, IsNullEdgeOracle IsNullEdge) {
-  assert(getVMCallbacks() && getVMCallbacks()->IsSubtype &&
-         "VMCallbacks must be set");
-  // Contract (see JavaType.h): Context is the terminator of a PHI incoming
-  // block and DestBB that PHI's parent. DestBB may equal Context's block for
-  // a self-referencing PHI arm (a loop-header back edge); the guard on such
-  // an edge is then conservatively empty (duplicate-edge rule in edgeGuard).
-  assert(Context && Context->isTerminator() &&
-         "sharpen requires the incoming block's terminator");
-  assert(DestBB && "sharpen requires the PHI parent block");
-
-  JavaTypeQueryContext Q{DT, IsNullEdge};
-  V = stripCastsAndFreeze(V, Q.DefinedValues);
-  JavaType Facts = factsAt(V, Context->getParent(), Q);
-  mergePathFacts(Facts, edgeGuard(Context->getParent(), DestBB, V, Q));
-  normalizeExcludedKlasses(Facts);
-  return Facts;
-}
-
 // =============================================================================
-// Main query
+// Cached query entry point
 // =============================================================================
 
-JavaType jeandle::getJavaType(Value *V, DominatorTree *DT, Instruction *Context,
-                              IsNullEdgeOracle IsNullEdge) {
+JavaType jeandle::getCachedJavaTypeV2(Value *V, DominatorTree *DT,
+                                     Instruction *Context,
+                                     IsNullEdgeOracle IsNullEdge,
+                                     JavaTypeCacheV2 &Cache,
+                                     CachedJavaTypeQueryInfo &Info,
+                                     JavaTypeCacheV2Diagnostics *Diagnostics,
+                                     JavaTypeFactsCacheV2 *FactsCache) {
   assert(getVMCallbacks() && getVMCallbacks()->IsSubtype &&
          "VMCallbacks must be set");
+  Info = {};
+  BaseQueryState State(Cache.BaseTypes, Info, Diagnostics);
   if (!DT || !Context) {
     DefinedMemo Defined;
-    return getBaseJavaType(V, nullptr, &Defined);
+    return getBaseJavaType(V, &Cache.BaseTypes, &Defined, &State);
   }
 
-  JavaTypeQueryContext Q{*DT, IsNullEdge};
+  assert((!FactsCache || FactsCache->getFunction() == Context->getFunction()) &&
+         "wrong facts cache owner");
+  JavaTypeQueryContext Q{*DT, IsNullEdge, Cache.BaseTypes, State, FactsCache};
   JavaType T = valueDimension(V, Q);
   return typeIntersect(T, factsAt(V, Context->getParent(), Q));
 }
