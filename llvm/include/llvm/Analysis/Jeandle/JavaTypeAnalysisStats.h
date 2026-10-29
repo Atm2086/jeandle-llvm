@@ -38,11 +38,13 @@ LLVM_ABI bool javaTypeStatsEnabled();
 
 /// Per-Function cumulative query, cache and verification counters; clear() only
 /// resets the cache and never these counters.
-/// BaseHits/BaseMisses only cover context-free queries, FactsHits/FactsMisses
-/// cover shared path-fact lookups, and FinalHits/FinalMisses cover final cache
-/// lookups from both top-level queries and PHI incoming values.
+/// BaseHits/BaseMisses cover base solver entry probes, including contextual
+/// queries. FactsHits/FactsMisses cover guard/null edge helpers; Final counters
+/// cover complete top-level queries only. Defined counters cover definedness
+/// proof entry probes. Each cache owns the source counters; this observer only
+/// aggregates emitted deltas across analysis lifetimes.
 /// Current*/Peak* come from the cache sizes reported by the observer, so
-/// printing never has to reach into JavaTypeCache.
+/// printing never has to reach into JavaTypeCacheV2.
 struct JavaTypeQueryStats {
   uint64_t Queries = 0;
   uint64_t FactsHits = 0;
@@ -52,6 +54,16 @@ struct JavaTypeQueryStats {
   uint64_t BaseHits = 0;
   uint64_t BaseMisses = 0;
   uint64_t BaseInsertions = 0;
+  uint64_t DefinedHits = 0;
+  uint64_t DefinedMisses = 0;
+  uint64_t DefinedInsertions = 0;
+  uint64_t GuardHits = 0;
+  uint64_t GuardMisses = 0;
+  uint64_t NullHits = 0;
+  uint64_t NullMisses = 0;
+  uint64_t FinalValidations = 0;
+  uint64_t FinalValidationFailures = 0;
+  uint64_t FinalBypasses = 0;
   uint64_t Bypasses = 0;
   uint64_t Clears = 0;
   uint64_t Invalidations = 0;
@@ -60,13 +72,16 @@ struct JavaTypeQueryStats {
   uint64_t InvalidationVisits = 0;
   uint64_t InvalidationUsesVisited = 0;
   uint64_t BaseSlotsScanned = 0;
+  uint64_t DefinedSlotsScanned = 0;
   uint64_t PathFactsSlotsScanned = 0;
   uint64_t FinalTypesSlotsScanned = 0;
   uint64_t BaseRemoved = 0;
+  uint64_t DefinedRemoved = 0;
   uint64_t FactsRemoved = 0;
   uint64_t FinalRemoved = 0;
   // Sums over invalidation events, not counts of distinct retained entries.
   uint64_t BaseRetained = 0;
+  uint64_t DefinedRetained = 0;
   uint64_t FactsRetained = 0;
   uint64_t FinalRetained = 0;
   uint64_t InvalidationTimeNanoseconds = 0;
@@ -74,11 +89,13 @@ struct JavaTypeQueryStats {
   uint64_t VerificationSkips = 0;
   uint64_t TotalQueryTimeNanoseconds = 0;
   size_t CurrentBaseEntries = 0;
+  size_t CurrentDefinedEntries = 0;
   size_t CurrentPathFactsEntries = 0;
   size_t CurrentFinalTypeEntries = 0;
   size_t PeakFactsEntries = 0;
   size_t PeakFinalEntries = 0;
   size_t PeakBaseEntries = 0;
+  size_t PeakDefinedEntries = 0;
 };
 
 /// Function-level statistics leaf analysis: it only holds counters and has no

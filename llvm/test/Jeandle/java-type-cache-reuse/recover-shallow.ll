@@ -1,6 +1,7 @@
 ; RUN: opt -S -jeandle-java-type-stats -passes="recover-type-info,print<java-type-analysis>" -jeandle-vm-callback-log=%S/Inputs/recover.cblog %s 2>&1 | FileCheck %s
 
 ; Two loads of different fields use the same QueryBase in sibling blocks.
+; Each distinct edge stores one guard and one null decision.
 
 define void @recover_shallow(ptr addrspace(1) "java-klass"="5" %obj, i1 %c) #0 gc "hotspotgc" {
 entry:
@@ -19,13 +20,15 @@ exit:
 
 ; CHECK-LABEL: JavaTypeAnalysis for function: recover_shallow
 ; CHECK:         queries: 2
-; CHECK:         path facts hits: 0
-; CHECK:         path facts misses: 2
+; CHECK:         edge facts hits: 0
+; CHECK:         edge facts misses: 4
+; CHECK:         guard edge computations: 2
+; CHECK:         null edge computations: 2
 ; CHECK:         final type hits: 0
 ; CHECK:         final type misses: 2
 ; CHECK:         base insertions: 1
 ; CHECK:         current base entries: 1
-; CHECK:         current path facts entries: 2
+; CHECK:         current edge facts entries: 4
 ; CHECK:         current final type entries: 2
 ; CHECK:         %l0 = load{{.*}}!java-klass
 ; CHECK:         %l1 = load{{.*}}!java-klass

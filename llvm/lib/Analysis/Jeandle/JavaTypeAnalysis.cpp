@@ -106,84 +106,84 @@ void printJavaType(raw_ostream &OS, const JavaType &Type) {
 
 AnalysisKey JavaTypeAnalysis::Key;
 
-/// Public query entry: selects the cache mode and, when statistics are enabled,
-/// reports one optional observation event.
-/// With verification enabled it also runs a query that shares no cache and
-/// compares the results when neither side was truncated or depends on a PHI
-/// cycle. With statistics disabled nothing is timed or counted; the verification
-/// recomputation never affects the returned result.
-/// @brief query entry, optional statistics and verification
-/// @param V
-/// @param Context
-/// @return
+/// Query through the V2 caches. Each cache owns its counters; the optional
+/// observer receives only this query's deltas. Verification uses the untouched
+/// original engine and compares complete types, including truncated and cyclic
+/// queries: V2 preserves their original query-local evaluation semantics.
 JavaType JavaTypeAnalysisResult::getJavaType(Value *V, Instruction *Context) {
   assert(V && "cannot query the Java type of a null Value");
   assert((!Context || Context->getFunction() == &F) &&
          "context must belong to the analyzed Function");
 
-  QueryClock::time_point Start = Observer ? QueryClock::now()
-                                          : QueryClock::time_point{};
-
   BasicBlock *ContextBB = Context ? Context->getParent() : nullptr;
-
-  size_t OldBaseEntries = Cache.baseSize();
-  CachedJavaTypeQueryInfo Info;
   LVINullEdgeOracle IsNullEdge{LVI};
-  JavaType Result;
-  bool Bypassed = false;
-  if (DisableJavaTypeCache) {
-    Bypassed = true;
-    Result = jeandle::getJavaType(V, &DT, Context, IsNullEdge);
-  } else {
-    Result = getCachedJavaType(V, &DT, Context, IsNullEdge, Cache, Info);
-  }
+  const bool Bypassed = DisableJavaTypeCache;
+  const bool Verified = VerifyJavaTypeCache && !Bypassed;
+  auto Query = [&] {
+    JavaType Result = Bypassed
+                          ? jeandle::getJavaType(V, &DT, Context, IsNullEdge)
+                          : getCachedJavaTypeV2(V, &DT, Context, IsNullEdge,
+                                                Cache);
+    if (Verified) {
+      JavaType Fresh = jeandle::getJavaType(V, &DT, Context, IsNullEdge);
+      if (Result != Fresh)
+        reportVerificationFailure(F, V, ContextBB, Result, Fresh);
+    }
+    return Result;
+  };
+  if (!Observer)
+    return Query();
 
-  // 可选重算校验，这里好像有点奇怪的问题
-  bool Verified = false;
-  bool VerificationSkipped = false;
-  if (VerifyJavaTypeCache && !DisableJavaTypeCache) {
-    Verified = true;
-    // The reference result always comes from the untouched original engine.
-    JavaType Fresh = jeandle::getJavaType(V, &DT, Context, IsNullEdge);
-    // The original API does not expose truncation/cycle diagnostics. A separate
-    // cold evaluation supplies only those flags, never the reference result.
-    JavaTypeCache DiagnosticCache;
-    CachedJavaTypeQueryInfo FreshInfo;
-    getCachedJavaType(V, &DT, Context, IsNullEdge, DiagnosticCache, FreshInfo);
-    // 缓存节省预算；PHI 环中完整缓存与局部贡献也可能精度不同。
-    // 跳过严格相等不代表验证通过，单独记录，后续需补语义包含关系校验。
-    if (Info.SkipVerification || FreshInfo.SkipVerification)
-      VerificationSkipped = true;
-    else if (Result != Fresh)
-      reportVerificationFailure(F, V, ContextBB, Result, Fresh);
-  }
-
-  if (Observer) {
-    JavaTypeQueryEvent Event;
-    Event.Info = Info;
-    Event.QueryValue = V;
-    Event.Context = ContextBB;
-    Event.BaseInsertions = Cache.baseSize() - OldBaseEntries;
-    Event.ElapsedNanoseconds = elapsedNanoseconds(Start);
-    Event.BaseEntries = Cache.baseSize();
-    Event.PathFactsEntries = Cache.pathFactsSize();
-    Event.FinalEntries = Cache.finalTypesSize();
-    Event.Bypassed = Bypassed;
-    Event.Verified = Verified;
-    Event.VerificationSkipped = VerificationSkipped;
-    Observer->onQuery(Event);
-  }
+  const auto Start = QueryClock::now();
+  const auto OldBase = Cache.Base.getStats();
+  const auto OldDefined = Cache.Defined.getStats();
+  const auto OldFacts = Cache.Facts.getStats();
+  const auto OldFinal = Cache.Final.getStats();
+  JavaType Result = Query();
+  JavaTypeQueryEvent Event;
+  const auto &Base = Cache.Base.getStats();
+  const auto &Defined = Cache.Defined.getStats();
+  const auto &Facts = Cache.Facts.getStats();
+  const auto &Final = Cache.Final.getStats();
+  Event.Info.BaseHits = Base.Hits - OldBase.Hits;
+  Event.Info.BaseMisses = Base.Misses - OldBase.Misses;
+  Event.Info.FactsHits = Facts.Hits - OldFacts.Hits;
+  Event.Info.FactsMisses = Facts.Misses - OldFacts.Misses;
+  Event.Info.FinalHits = Final.Hits - OldFinal.Hits;
+  Event.Info.FinalMisses = Final.Misses - OldFinal.Misses;
+  Event.DefinedHits = Defined.Hits - OldDefined.Hits;
+  Event.DefinedMisses = Defined.Misses - OldDefined.Misses;
+  Event.DefinedInsertions = Defined.EntriesAdded - OldDefined.EntriesAdded;
+  Event.GuardHits = Facts.GuardHits - OldFacts.GuardHits;
+  Event.GuardMisses = Facts.GuardComputed - OldFacts.GuardComputed;
+  Event.NullHits = Facts.NullHits - OldFacts.NullHits;
+  Event.NullMisses = Facts.NullComputed - OldFacts.NullComputed;
+  Event.FinalValidations = Final.Validations - OldFinal.Validations;
+  Event.FinalValidationFailures =
+      Final.ValidationFailures - OldFinal.ValidationFailures;
+  Event.FinalBypasses = Final.Bypasses - OldFinal.Bypasses;
+  Event.QueryValue = V;
+  Event.Context = ContextBB;
+  Event.BaseInsertions = Base.EntriesAdded - OldBase.EntriesAdded;
+  Event.ElapsedNanoseconds = elapsedNanoseconds(Start);
+  Event.BaseEntries = Cache.baseSize();
+  Event.DefinedEntries = Cache.definedSize();
+  Event.PathFactsEntries = Cache.pathFactsSize();
+  Event.FinalEntries = Cache.finalTypesSize();
+  Event.Bypassed = Bypassed;
+  Event.Verified = Verified;
+  Observer->onQuery(Event);
   return Result;
 }
 
-/// 粗粒度失效：清空基础类型、路径事实及最终类型缓存，保留累计统计。
-/// pass 内发生相关 IR 修改后，必须在下一次查询前调用；DT/LVI 由调用方维护。
+/// Clear all four caches and LVI without resetting cumulative statistics.
+/// Notify before mutation; callers still maintain DT before the next query.
 void JavaTypeAnalysisResult::clear() {
   invalidateImpl({}, false, true);
 }
 
 /// Invalidate the old use closure before RAUW/deletion, including non-key
-/// conditions. Caller maintains DT/LVI before the next query.
+/// conditions. LVI is cleared here; callers maintain DT before the next query.
 void JavaTypeAnalysisResult::invalidate(Value &Changed) {
   Value *V = &Changed;
   invalidate({V});
@@ -202,9 +202,10 @@ void JavaTypeAnalysisResult::invalidateForCFGChange(Value &Changed) {
 void JavaTypeAnalysisResult::invalidateImpl(ArrayRef<Value *> Changed,
                                             bool CFGChanged, bool ForceFull) {
   auto Start = Observer ? QueryClock::now() : QueryClock::time_point{};
-  JavaTypeCacheInvalidationInfo Info;
+  JavaTypeCacheV2InvalidationInfo Info;
   if (ForceFull) {
     Info.BaseRemoved = Cache.baseSize();
+    Info.DefinedRemoved = Cache.definedSize();
     Info.FactsRemoved = Cache.pathFactsSize();
     Info.FinalRemoved = Cache.finalTypesSize();
     Info.FullClear = true;
@@ -216,11 +217,16 @@ void JavaTypeAnalysisResult::invalidateImpl(ArrayRef<Value *> Changed,
             ? JavaTypeBaseInvalidationMode::Scan
             : JavaTypeBaseInvalidationMode::SelectiveKeys);
   }
+  // Even an unrelated instruction edit can change LVI's bounded reasoning.
+  // Drop its old results before mutation. Final entries retained by the cache
+  // must revalidate their observed null-edge answers before reuse.
+  LVI.clear();
   if (!Observer)
     return;
   JavaTypeInvalidationEvent Event;
   Event.Info = Info;
   Event.BaseEntries = Cache.baseSize();
+  Event.DefinedEntries = Cache.definedSize();
   Event.PathFactsEntries = Cache.pathFactsSize();
   Event.FinalEntries = Cache.finalTypesSize();
   Event.CFGChanged = CFGChanged;

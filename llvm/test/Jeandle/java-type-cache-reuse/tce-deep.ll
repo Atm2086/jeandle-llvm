@@ -2,7 +2,9 @@
 ;
 ; P4 deep-CFG control: the same receiver is queried in four serialized context
 ; blocks. There is no Final sharing across blocks, but the Base entry survives;
-; this isolates context depth from query count and shared DAG size.
+; this isolates context depth from query count and shared DAG size. Folding the
+; downstream checks invalidates three Final dependency regions; the entry-block
+; query survives because it does not depend on those instructions.
 
 declare i1 @jeandle.check_instanceof(ptr, ptr addrspace(1) nonnull)
 
@@ -29,11 +31,11 @@ exit:
 ; CHECK:         final type misses: 4
 ; CHECK:         base insertions: 1
 ; CHECK:         current base entries: 1
-; CHECK:         current final type entries: 0
+; CHECK:         current final type entries: 1
 ; CHECK:         peak final type entries: 4
 ; CHECK:         invalidation requests: 1
 ; CHECK:         base entries invalidated: 0
-; CHECK:         final type entries invalidated: 4
+; CHECK:         final type entries invalidated: 3
 
 attributes #0 = { "java-method"="0" }
 !java-method-compilation = !{}

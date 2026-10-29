@@ -39,13 +39,26 @@ ALWAYS_ENABLED_STATISTIC(TotalCFGInvalidations, "Java type CFG invalidations");
 ALWAYS_ENABLED_STATISTIC(TotalInvalidationVisits, "Java type invalidation values visited");
 ALWAYS_ENABLED_STATISTIC(TotalInvalidationUsesVisited, "Java type invalidation uses visited");
 ALWAYS_ENABLED_STATISTIC(TotalBaseSlotsScanned, "Java type invalidation base slots scanned");
-ALWAYS_ENABLED_STATISTIC(TotalPathFactsSlotsScanned, "Java type invalidation path-facts slots scanned");
+ALWAYS_ENABLED_STATISTIC(TotalPathFactsSlotsScanned, "Java type invalidation edge-facts slots scanned");
 ALWAYS_ENABLED_STATISTIC(TotalFinalTypesSlotsScanned, "Java type invalidation final-type slots scanned");
+ALWAYS_ENABLED_STATISTIC(TotalDefinedHits, "Java type definedness cache hits");
+ALWAYS_ENABLED_STATISTIC(TotalDefinedMisses, "Java type definedness cache misses");
+ALWAYS_ENABLED_STATISTIC(TotalDefinedInsertions, "Java type definedness cache insertions");
+ALWAYS_ENABLED_STATISTIC(TotalDefinedRemoved, "Java type definedness entries invalidated");
+ALWAYS_ENABLED_STATISTIC(TotalDefinedRetained, "Java type definedness entries retained");
+ALWAYS_ENABLED_STATISTIC(TotalDefinedSlotsScanned, "Java type invalidation definedness slots scanned");
+ALWAYS_ENABLED_STATISTIC(TotalFinalValidations, "Java type final cache revalidations");
+ALWAYS_ENABLED_STATISTIC(TotalFinalValidationFailures, "Java type final cache revalidation failures");
+ALWAYS_ENABLED_STATISTIC(TotalFinalBypasses, "Java type final cache bypasses");
+ALWAYS_ENABLED_STATISTIC(TotalGuardHits, "Java type guard edge cache hits");
+ALWAYS_ENABLED_STATISTIC(TotalGuardMisses, "Java type guard edge computations");
+ALWAYS_ENABLED_STATISTIC(TotalNullHits, "Java type null edge cache hits");
+ALWAYS_ENABLED_STATISTIC(TotalNullMisses, "Java type null edge computations");
 ALWAYS_ENABLED_STATISTIC(TotalBaseRemoved, "Java type base entries invalidated");
-ALWAYS_ENABLED_STATISTIC(TotalFactsRemoved, "Java type path facts entries invalidated");
+ALWAYS_ENABLED_STATISTIC(TotalFactsRemoved, "Java type edge facts entries invalidated");
 ALWAYS_ENABLED_STATISTIC(TotalFinalRemoved, "Java type final type entries invalidated");
 ALWAYS_ENABLED_STATISTIC(TotalBaseRetained, "Java type base entries retained");
-ALWAYS_ENABLED_STATISTIC(TotalFactsRetained, "Java type path facts entries retained");
+ALWAYS_ENABLED_STATISTIC(TotalFactsRetained, "Java type edge facts entries retained");
 ALWAYS_ENABLED_STATISTIC(TotalFinalRetained, "Java type final type entries retained");
 ALWAYS_ENABLED_STATISTIC(TotalInvalidationTimeNanoseconds, "Java type total invalidation time (ns)");
 ALWAYS_ENABLED_STATISTIC(TotalQueryTimeNanoseconds, "Java type total query time (ns)");
@@ -53,17 +66,17 @@ ALWAYS_ENABLED_STATISTIC(TotalQueryTimeNanoseconds, "Java type total query time 
 ALWAYS_ENABLED_STATISTIC(TotalQueries,
                         "Java type analysis queries");
 ALWAYS_ENABLED_STATISTIC(TotalFactsHits,
-                        "Java type path-facts cache hits");
+                        "Java type edge-facts cache hits");
 ALWAYS_ENABLED_STATISTIC(TotalFactsMisses,
-                        "Java type path-facts cache misses");
+                        "Java type edge-facts cache misses");
 ALWAYS_ENABLED_STATISTIC(TotalFinalHits,
                         "Java type final-type cache hits");
 ALWAYS_ENABLED_STATISTIC(TotalFinalMisses,
                         "Java type final-type cache misses");
 ALWAYS_ENABLED_STATISTIC(TotalBaseHits,
-                        "Java type base-only query cache hits");
+                        "Java type base query cache hits");
 ALWAYS_ENABLED_STATISTIC(TotalBaseMisses,
-                        "Java type base-only query cache misses");
+                        "Java type base query cache misses");
 ALWAYS_ENABLED_STATISTIC(TotalBaseInsertions,
                         "Java type base-cache insertions");
 ALWAYS_ENABLED_STATISTIC(TotalBypasses,
@@ -73,7 +86,7 @@ ALWAYS_ENABLED_STATISTIC(TotalClears,
 ALWAYS_ENABLED_STATISTIC(TotalVerifications,
                         "Java type cache verification queries");
 ALWAYS_ENABLED_STATISTIC(TotalVerificationSkips,
-                        "Java type truncated or PHI-cycle comparisons skipped");
+                        "Java type verification comparisons skipped");
 
 /// Prints a cache hit rate; prints n/a when there is no sample yet so that we
 /// never divide by zero.
@@ -91,8 +104,8 @@ AnalysisKey JavaTypeStatsAnalysis::Key;
 
 bool jeandle::javaTypeStatsEnabled() { return CollectJavaTypeStats; }
 
-/// The only place counters are accumulated, including the process-wide `-stats`
-/// numbers, so the default query path never touches an atomic.
+/// Aggregates the cache-owned counter deltas and process-wide `-stats` numbers.
+/// The default query path never touches an atomic.
 /// @brief accumulate one query
 void JavaTypeStatsAnalysis::Result::onQuery(const JavaTypeQueryEvent &Event) {
   const CachedJavaTypeQueryInfo &Info = Event.Info;
@@ -115,7 +128,9 @@ void JavaTypeStatsAnalysis::Result::onQuery(const JavaTypeQueryEvent &Event) {
            << " facts_misses: " << Info.FactsMisses
            << " final_hits: " << Info.FinalHits
            << " final_misses: " << Info.FinalMisses
-           << " base_insertions: " << Event.BaseInsertions << '\n';
+           << " base_insertions: " << Event.BaseInsertions
+           << " defined_hits: " << Event.DefinedHits
+           << " defined_misses: " << Event.DefinedMisses << '\n';
   }
 
   Stats.BaseHits += Info.BaseHits;
@@ -131,13 +146,38 @@ void JavaTypeStatsAnalysis::Result::onQuery(const JavaTypeQueryEvent &Event) {
   TotalFinalHits += Info.FinalHits;
   TotalFinalMisses += Info.FinalMisses;
 
+  Stats.DefinedHits += Event.DefinedHits;
+  TotalDefinedHits += Event.DefinedHits;
+  Stats.DefinedMisses += Event.DefinedMisses;
+  TotalDefinedMisses += Event.DefinedMisses;
+  Stats.DefinedInsertions += Event.DefinedInsertions;
+  TotalDefinedInsertions += Event.DefinedInsertions;
+  Stats.GuardHits += Event.GuardHits;
+  TotalGuardHits += Event.GuardHits;
+  Stats.GuardMisses += Event.GuardMisses;
+  TotalGuardMisses += Event.GuardMisses;
+  Stats.NullHits += Event.NullHits;
+  TotalNullHits += Event.NullHits;
+  Stats.NullMisses += Event.NullMisses;
+  TotalNullMisses += Event.NullMisses;
+
+  Stats.FinalValidations += Event.FinalValidations;
+  TotalFinalValidations += Event.FinalValidations;
+  Stats.FinalValidationFailures += Event.FinalValidationFailures;
+  TotalFinalValidationFailures += Event.FinalValidationFailures;
+  Stats.FinalBypasses += Event.FinalBypasses;
+  TotalFinalBypasses += Event.FinalBypasses;
+
   Stats.BaseInsertions += Event.BaseInsertions;
   TotalBaseInsertions += Event.BaseInsertions;
 
   Stats.CurrentBaseEntries = Event.BaseEntries;
+  Stats.CurrentDefinedEntries = Event.DefinedEntries;
   Stats.CurrentPathFactsEntries = Event.PathFactsEntries;
   Stats.CurrentFinalTypeEntries = Event.FinalEntries;
   Stats.PeakBaseEntries = std::max(Stats.PeakBaseEntries, Event.BaseEntries);
+  Stats.PeakDefinedEntries =
+      std::max(Stats.PeakDefinedEntries, Event.DefinedEntries);
   Stats.PeakFactsEntries =
       std::max(Stats.PeakFactsEntries, Event.PathFactsEntries);
   Stats.PeakFinalEntries =
@@ -163,7 +203,7 @@ void JavaTypeStatsAnalysis::Result::onQuery(const JavaTypeQueryEvent &Event) {
 /// @brief accumulate one invalidation notification
 void JavaTypeStatsAnalysis::Result::onInvalidation(
     const JavaTypeInvalidationEvent &Event) {
-  const JavaTypeCacheInvalidationInfo &Info = Event.Info;
+  const JavaTypeCacheV2InvalidationInfo &Info = Event.Info;
 
   ++Stats.Invalidations;
   ++TotalInvalidations;
@@ -189,6 +229,10 @@ void JavaTypeStatsAnalysis::Result::onInvalidation(
   TotalPathFactsSlotsScanned += Info.PathFactsSlotsScanned;
   Stats.FinalTypesSlotsScanned += Info.FinalTypesSlotsScanned;
   TotalFinalTypesSlotsScanned += Info.FinalTypesSlotsScanned;
+  Stats.DefinedSlotsScanned += Info.DefinedSlotsScanned;
+  TotalDefinedSlotsScanned += Info.DefinedSlotsScanned;
+  Stats.DefinedRemoved += Info.DefinedRemoved;
+  TotalDefinedRemoved += Info.DefinedRemoved;
   Stats.BaseRemoved += Info.BaseRemoved;
   TotalBaseRemoved += Info.BaseRemoved;
   Stats.FactsRemoved += Info.FactsRemoved;
@@ -196,6 +240,8 @@ void JavaTypeStatsAnalysis::Result::onInvalidation(
   Stats.FinalRemoved += Info.FinalRemoved;
   TotalFinalRemoved += Info.FinalRemoved;
 
+  Stats.DefinedRetained += Event.DefinedEntries;
+  TotalDefinedRetained += Event.DefinedEntries;
   Stats.BaseRetained += Event.BaseEntries;
   TotalBaseRetained += Event.BaseEntries;
   Stats.FactsRetained += Event.PathFactsEntries;
@@ -204,6 +250,7 @@ void JavaTypeStatsAnalysis::Result::onInvalidation(
   TotalFinalRetained += Event.FinalEntries;
 
   Stats.CurrentBaseEntries = Event.BaseEntries;
+  Stats.CurrentDefinedEntries = Event.DefinedEntries;
   Stats.CurrentPathFactsEntries = Event.PathFactsEntries;
   Stats.CurrentFinalTypeEntries = Event.FinalEntries;
 
@@ -212,32 +259,46 @@ void JavaTypeStatsAnalysis::Result::onInvalidation(
 }
 
 /// Prints the cumulative query counters of the current Function plus the
-/// current and peak sizes of the three caches. facts/final numbers correspond to
-/// shared cache lookups, while the base hit rate only covers explicit base-only
-/// queries.
+/// current and peak sizes of all four caches. Edge helpers and top-level final
+/// lookups are counted separately; base probes also include contextual queries.
 void JavaTypeStatsAnalysis::Result::print(raw_ostream &OS) const {
   OS << "JavaTypeAnalysis for function: " << F.getName() << '\n';
   OS << "  queries: " << Stats.Queries << '\n';
-  OS << "  path facts hits: " << Stats.FactsHits << '\n';
-  OS << "  path facts misses: " << Stats.FactsMisses << '\n';
-  OS << "  path facts hit rate: ";
+  OS << "  edge facts hits: " << Stats.FactsHits << '\n';
+  OS << "  edge facts misses: " << Stats.FactsMisses << '\n';
+  OS << "  edge facts hit rate: ";
   printRate(OS, Stats.FactsHits, Stats.FactsMisses);
   OS << '\n';
+  OS << "  guard edge hits: " << Stats.GuardHits << '\n';
+  OS << "  guard edge computations: " << Stats.GuardMisses << '\n';
+  OS << "  null edge hits: " << Stats.NullHits << '\n';
+  OS << "  null edge computations: " << Stats.NullMisses << '\n';
   OS << "  final type hits: " << Stats.FinalHits << '\n';
   OS << "  final type misses: " << Stats.FinalMisses << '\n';
   OS << "  final type hit rate: ";
   printRate(OS, Stats.FinalHits, Stats.FinalMisses);
   OS << '\n';
-  OS << "  base-only query hits: " << Stats.BaseHits << '\n';
-  OS << "  base-only query misses: " << Stats.BaseMisses << '\n';
-  OS << "  base-only query hit rate: ";
+  OS << "  final validations: " << Stats.FinalValidations << '\n';
+  OS << "  final validation failures: " << Stats.FinalValidationFailures << '\n';
+  OS << "  final bypasses: " << Stats.FinalBypasses << '\n';
+  OS << "  base query hits: " << Stats.BaseHits << '\n';
+  OS << "  base query misses: " << Stats.BaseMisses << '\n';
+  OS << "  base query hit rate: ";
   printRate(OS, Stats.BaseHits, Stats.BaseMisses);
   OS << '\n';
+  OS << "  defined hits: " << Stats.DefinedHits << '\n';
+  OS << "  defined misses: " << Stats.DefinedMisses << '\n';
+  OS << "  defined hit rate: ";
+  printRate(OS, Stats.DefinedHits, Stats.DefinedMisses);
+  OS << '\n';
+  OS << "  defined insertions: " << Stats.DefinedInsertions << '\n';
+  OS << "  current defined entries: " << Stats.CurrentDefinedEntries << '\n';
+  OS << "  peak defined entries: " << Stats.PeakDefinedEntries << '\n';
   OS << "  base insertions: " << Stats.BaseInsertions << '\n';
   OS << "  current base entries: " << Stats.CurrentBaseEntries << '\n';
   OS << "  peak base entries: " << Stats.PeakBaseEntries << '\n';
-  OS << "  current path facts entries: " << Stats.CurrentPathFactsEntries << '\n';
-  OS << "  peak path facts entries: " << Stats.PeakFactsEntries << '\n';
+  OS << "  current edge facts entries: " << Stats.CurrentPathFactsEntries << '\n';
+  OS << "  peak edge facts entries: " << Stats.PeakFactsEntries << '\n';
   OS << "  current final type entries: " << Stats.CurrentFinalTypeEntries << '\n';
   OS << "  peak final type entries: " << Stats.PeakFinalEntries << '\n';
   OS << "  clears: " << Stats.Clears << '\n';
@@ -248,15 +309,18 @@ void JavaTypeStatsAnalysis::Result::print(raw_ostream &OS) const {
   OS << "  invalidation uses visited: " << Stats.InvalidationUsesVisited
      << '\n';
   OS << "  invalidation base slots scanned: " << Stats.BaseSlotsScanned << '\n';
-  OS << "  invalidation path-facts slots scanned: " << Stats.PathFactsSlotsScanned
+  OS << "  invalidation edge-facts slots scanned: " << Stats.PathFactsSlotsScanned
      << '\n';
   OS << "  invalidation final-type slots scanned: "
      << Stats.FinalTypesSlotsScanned << '\n';
+  OS << "  invalidation defined slots scanned: " << Stats.DefinedSlotsScanned << '\n';
+  OS << "  defined entries invalidated: " << Stats.DefinedRemoved << '\n';
+  OS << "  defined entries retained: " << Stats.DefinedRetained << '\n';
   OS << "  base entries invalidated: " << Stats.BaseRemoved << '\n';
-  OS << "  path facts entries invalidated: " << Stats.FactsRemoved << '\n';
+  OS << "  edge facts entries invalidated: " << Stats.FactsRemoved << '\n';
   OS << "  final type entries invalidated: " << Stats.FinalRemoved << '\n';
   OS << "  base entries retained: " << Stats.BaseRetained << '\n';
-  OS << "  path facts entries retained: " << Stats.FactsRetained << '\n';
+  OS << "  edge facts entries retained: " << Stats.FactsRetained << '\n';
   OS << "  final type entries retained: " << Stats.FinalRetained << '\n';
   OS << "  total invalidation time (ns): " << Stats.InvalidationTimeNanoseconds << '\n';
   OS << "  bypasses: " << Stats.Bypasses << '\n';
@@ -300,12 +364,22 @@ PreservedAnalyses
 JavaTypeAnalysisSummaryPrinterPass::run(Module &M, ModuleAnalysisManager &) {
   OS << "JavaTypeAnalysis process summary after module: " << M.getName() << '\n';
   OS << "  queries: " << TotalQueries.getValue() << '\n';
-  OS << "  path facts hits: " << TotalFactsHits.getValue() << '\n';
-  OS << "  path facts misses: " << TotalFactsMisses.getValue() << '\n';
+  OS << "  edge facts hits: " << TotalFactsHits.getValue() << '\n';
+  OS << "  edge facts misses: " << TotalFactsMisses.getValue() << '\n';
+  OS << "  guard edge hits: " << TotalGuardHits.getValue() << '\n';
+  OS << "  guard edge computations: " << TotalGuardMisses.getValue() << '\n';
+  OS << "  null edge hits: " << TotalNullHits.getValue() << '\n';
+  OS << "  null edge computations: " << TotalNullMisses.getValue() << '\n';
   OS << "  final type hits: " << TotalFinalHits.getValue() << '\n';
   OS << "  final type misses: " << TotalFinalMisses.getValue() << '\n';
-  OS << "  base-only query hits: " << TotalBaseHits.getValue() << '\n';
-  OS << "  base-only query misses: " << TotalBaseMisses.getValue() << '\n';
+  OS << "  final validations: " << TotalFinalValidations.getValue() << '\n';
+  OS << "  final validation failures: " << TotalFinalValidationFailures.getValue() << '\n';
+  OS << "  final bypasses: " << TotalFinalBypasses.getValue() << '\n';
+  OS << "  base query hits: " << TotalBaseHits.getValue() << '\n';
+  OS << "  base query misses: " << TotalBaseMisses.getValue() << '\n';
+  OS << "  defined hits: " << TotalDefinedHits.getValue() << '\n';
+  OS << "  defined misses: " << TotalDefinedMisses.getValue() << '\n';
+  OS << "  defined insertions: " << TotalDefinedInsertions.getValue() << '\n';
   OS << "  base insertions: " << TotalBaseInsertions.getValue() << '\n';
   OS << "  clears: " << TotalClears.getValue() << '\n';
   OS << "  invalidation requests: " << TotalInvalidations.getValue() << '\n';
@@ -315,15 +389,18 @@ JavaTypeAnalysisSummaryPrinterPass::run(Module &M, ModuleAnalysisManager &) {
   OS << "  invalidation uses visited: "
      << TotalInvalidationUsesVisited.getValue() << '\n';
   OS << "  invalidation base slots scanned: " << TotalBaseSlotsScanned.getValue() << '\n';
-  OS << "  invalidation path-facts slots scanned: "
+  OS << "  invalidation edge-facts slots scanned: "
      << TotalPathFactsSlotsScanned.getValue() << '\n';
   OS << "  invalidation final-type slots scanned: "
      << TotalFinalTypesSlotsScanned.getValue() << '\n';
+  OS << "  invalidation defined slots scanned: " << TotalDefinedSlotsScanned.getValue() << '\n';
+  OS << "  defined entries invalidated: " << TotalDefinedRemoved.getValue() << '\n';
+  OS << "  defined entries retained: " << TotalDefinedRetained.getValue() << '\n';
   OS << "  base entries invalidated: " << TotalBaseRemoved.getValue() << '\n';
-  OS << "  path facts entries invalidated: " << TotalFactsRemoved.getValue() << '\n';
+  OS << "  edge facts entries invalidated: " << TotalFactsRemoved.getValue() << '\n';
   OS << "  final type entries invalidated: " << TotalFinalRemoved.getValue() << '\n';
   OS << "  base entries retained: " << TotalBaseRetained.getValue() << '\n';
-  OS << "  path facts entries retained: " << TotalFactsRetained.getValue() << '\n';
+  OS << "  edge facts entries retained: " << TotalFactsRetained.getValue() << '\n';
   OS << "  final type entries retained: " << TotalFinalRetained.getValue() << '\n';
   OS << "  total invalidation time (ns): " << TotalInvalidationTimeNanoseconds.getValue() << '\n';
   OS << "  total query time (ns): " << TotalQueryTimeNanoseconds.getValue() << '\n';

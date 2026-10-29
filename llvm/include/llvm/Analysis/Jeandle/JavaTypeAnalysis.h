@@ -9,7 +9,7 @@
 #ifndef LLVM_ANALYSIS_JEANDLE_JAVATYPEANALYSIS_H
 #define LLVM_ANALYSIS_JEANDLE_JAVATYPEANALYSIS_H
 
-#include "llvm/Analysis/Jeandle/CachedJavaType.h"
+#include "llvm/Analysis/Jeandle/CachedJavaTypeV2.h"
 #include "llvm/IR/PassManager.h"
 
 #include <cstddef>
@@ -28,8 +28,8 @@ class Value;
 namespace jeandle {
 
 /// Optional observations of one query, only built and reported when statistics
-/// are enabled. Info carries this query's hit/miss deltas and BaseInsertions is
-/// the net number of newly inserted base entries.
+/// are enabled. Info retains the shared hit/miss payload shape; V2 never sets
+/// its legacy SkipVerification flag. Insertions count new cache entries.
 struct JavaTypeQueryEvent {
   CachedJavaTypeQueryInfo Info;
   /// Top-level query keys. These pointers are valid while the observer runs;
@@ -37,8 +37,19 @@ struct JavaTypeQueryEvent {
   Value *QueryValue = nullptr;
   BasicBlock *Context = nullptr;
   uint64_t BaseInsertions = 0;
+  uint64_t DefinedHits = 0;
+  uint64_t DefinedMisses = 0;
+  uint64_t DefinedInsertions = 0;
+  uint64_t GuardHits = 0;
+  uint64_t GuardMisses = 0;
+  uint64_t NullHits = 0;
+  uint64_t NullMisses = 0;
+  uint64_t FinalValidations = 0;
+  uint64_t FinalValidationFailures = 0;
+  uint64_t FinalBypasses = 0;
   uint64_t ElapsedNanoseconds = 0;
   size_t BaseEntries = 0;
+  size_t DefinedEntries = 0;
   size_t PathFactsEntries = 0;
   size_t FinalEntries = 0;
   bool Bypassed = false;
@@ -48,9 +59,10 @@ struct JavaTypeQueryEvent {
 
 /// Optional observations of one invalidation notification.
 struct JavaTypeInvalidationEvent {
-  JavaTypeCacheInvalidationInfo Info;
+  JavaTypeCacheV2InvalidationInfo Info;
   uint64_t ElapsedNanoseconds = 0;
   size_t BaseEntries = 0;
+  size_t DefinedEntries = 0;
   size_t PathFactsEntries = 0;
   size_t FinalEntries = 0;
   bool CFGChanged = false;
@@ -69,9 +81,11 @@ public:
 };
 
 /// 单个 Function 的分析结果，供优化 Pass 查询 JavaType 并管理缓存失效。
-/// 持有 BaseTypes、PathFacts 和 FinalTypes，跨查询复用基础类型、路径事实及最终类型；
-/// 递归栈和预算仍属于单次查询，DT/LVI 由分析管理器提供，本类只持有引用。
-/// IR 修改前通知受影响的值；下一次查询前必须更新 DT/LVI。
+/// Owns separate Base, Defined, edge Facts and top-level Final caches. Traversal
+/// stacks and budgets remain local to each query. DT/LVI belong to the analysis
+/// manager. Notify before IR mutation; this result clears LVI and callers must
+/// update DT before querying again. External LVI maintenance without an IR
+/// notification also requires clear().
 /// Statistics and timing are not implemented here: queries and invalidations are
 /// reported to an optional Observer, and nothing is collected by default.
 class JavaTypeAnalysisResult {
@@ -81,12 +95,15 @@ public:
                                 Instruction *Context = nullptr);
   LLVM_ABI void clear();
   // Notify before RAUW/deletion so the old use graph can still be traversed.
+  // Ordinary IR APIs do not call these notifications. Also include destination
+  // blocks for insertion/movement; set CFGChanged for structural CFG edits.
   // Unknown changes and changes to VM type information require clear().
   LLVM_ABI void invalidate(Value &Changed);
   LLVM_ABI void invalidate(ArrayRef<Value *> Changed, bool CFGChanged = false);
   LLVM_ABI void invalidateForCFGChange(Value &Changed);
 
-  // llvm 分析管理器的失效回调
+  // PassManager calls this at pass boundaries using PreservedAnalyses. It
+  // decides whether to discard the whole Result, not which Values changed.
   LLVM_ABI bool invalidate(Function &F, const PreservedAnalyses &PA,
                            FunctionAnalysisManager::Invalidator &Inv);
 
@@ -96,7 +113,10 @@ private:
 
   JavaTypeAnalysisResult(Function &F, DominatorTree &DT, LazyValueInfo &LVI,
                          JavaTypeQueryObserver *Observer)
-      : F(F), DT(DT), LVI(LVI), Observer(Observer) {}
+      : F(F), DT(DT), LVI(LVI), Observer(Observer),
+        Cache(F, JavaTypeFactsCacheV2::Mode::StableOracleEpoch) {
+    Cache.setStatsEnabled(Observer != nullptr);
+  }
 
   Function &F;
   DominatorTree &DT;
@@ -106,7 +126,7 @@ private:
   /// clock.
   JavaTypeQueryObserver *const Observer;
 
-  JavaTypeCache Cache;
+  JavaTypeCacheV2 Cache;
 
   void invalidateImpl(ArrayRef<Value *> Changed, bool CFGChanged,
                       bool ForceFull);

@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/Analysis/Jeandle/CachedJavaType.h"
 #include "llvm/Analysis/Jeandle/JavaTypeAnalysis.h"
 #include "llvm/Analysis/Jeandle/JavaTypeAnalysisStats.h"
 #include "llvm/Analysis/Jeandle/LVINullEdgeOracle.h"
@@ -248,7 +249,7 @@ TEST_F(JavaTypeQueryTest, IrreducibleCycleStaysLocal) {
   PB.registerFunctionAnalyses(FAM);
   auto &Result = FAM.getResult<JavaTypeAnalysis>(*F);
   EXPECT_TRUE(Result.getJavaType(V, block(*F, "a")->getTerminator()).isUnknown());
-  EXPECT_NE(statistics(FAM, F).find("current final type entries: 0"),
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
             std::string::npos);
 }
 
@@ -265,7 +266,7 @@ TEST_F(JavaTypeQueryTest, ResultInvalidationAfterConditionAndAttributeChange) {
   EXPECT_EQ(Result.getJavaType(V, Context).Klass, 22U);
   EXPECT_TRUE(Result.getJavaType(V).isUnknown());
 
-  // 缓存键 V 未变，只改分支条件；细粒度入口当前必须回退为全量清空。
+  // The queried value is unchanged; its controlling branch is a dependency.
   auto *Branch = cast<BranchInst>(block(*F, "guard")->getTerminator());
   Result.invalidate(*Branch);
   Branch->setCondition(F->getArg(1));
@@ -299,13 +300,13 @@ TEST_F(JavaTypeQueryTest, FinalTypesAreKeyedByContextBlock) {
   Result.clear();
   EXPECT_NE(statistics(FAM, F).find("current final type entries: 0"),
             std::string::npos);
-  EXPECT_NE(statistics(FAM, F).find("current path facts entries: 0"),
+  EXPECT_NE(statistics(FAM, F).find("current edge facts entries: 0"),
             std::string::npos);
   EXPECT_NE(statistics(FAM, F).find("current base entries: 0"),
             std::string::npos);
 }
 
-TEST_F(JavaTypeQueryTest, RecursiveFinalHitStillAppliesIncomingGuard) {
+TEST_F(JavaTypeQueryTest, FinalCacheDoesNotReplacePhiIncomingEvaluation) {
   ScopedQueryOption<bool> Verify("jeandle-verify-java-type-cache", true);
   Function *F = parse(R"(
     declare i1 @jeandle.check_instanceof(ptr, ptr nonnull)
@@ -329,7 +330,7 @@ TEST_F(JavaTypeQueryTest, RecursiveFinalHitStillAppliesIncomingGuard) {
             1U);
   BasicBlock *Hit = block(*F, "hit");
   EXPECT_EQ(Result.getJavaType(&Hit->front(), Hit->getTerminator()).Klass, 22U);
-  EXPECT_NE(statistics(FAM, F).find("final type hits: 1"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("final type hits: 0"), std::string::npos);
   EXPECT_NE(statistics(FAM, F).find("current final type entries: 2"),
             std::string::npos);
   EXPECT_NE(statistics(FAM, F).find("verification skips: 0"), std::string::npos);
@@ -400,16 +401,17 @@ TEST_F(JavaTypeQueryTest, PhiCycleIntermediateIsNotPublished) {
   EXPECT_EQ(Result.getJavaType(A, Context).Klass, 1U);
   EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
             std::string::npos);
-  // 独立查询 b 时可读取 a 的完整缓存，不能返回之前递归中的局部 Dog。
+  // A completed top-level result is not substituted for a recursive input.
   EXPECT_EQ(Result.getJavaType(B, Context).Klass, 1U);
-  EXPECT_NE(statistics(FAM, F).find("final type hits: 1"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("final type hits: 0"), std::string::npos);
   EXPECT_NE(statistics(FAM, F).find("current final type entries: 2"),
             std::string::npos);
   EXPECT_EQ(Result.getJavaType(B, Context).Klass, 1U);
-  EXPECT_NE(statistics(FAM, F).find("verification skips: 3"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("final type hits: 1"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("verification skips: 0"), std::string::npos);
 }
 
-TEST_F(JavaTypeQueryTest, CompletePhiCacheCanImproveCyclePrecision) {
+TEST_F(JavaTypeQueryTest, CompletePhiCachePreservesOriginalCyclePrecision) {
   ScopedQueryOption<bool> Verify("jeandle-verify-java-type-cache", true);
   Function *F = parse(R"(
     declare i1 @jeandle.check_instanceof(ptr, ptr nonnull)
@@ -440,10 +442,10 @@ TEST_F(JavaTypeQueryTest, CompletePhiCacheCanImproveCyclePrecision) {
   EXPECT_EQ(Result.getJavaType(A, Context).Klass, 1U);
   Result.clear();
   EXPECT_EQ(Result.getJavaType(B, Context).Klass, 1U);
-  // 完整 b 缓存是 Animal，可被回边的 Cat guard 收窄，a 得到更精确的 Cat。
-  EXPECT_EQ(Result.getJavaType(A, Context).Klass, 22U);
-  EXPECT_EQ(Result.getJavaType(A, Context).Klass, 22U);
-  EXPECT_NE(statistics(FAM, F).find("verification skips: 4"), std::string::npos);
+  // Warming B must not substitute its completed result inside A's recursion.
+  EXPECT_EQ(Result.getJavaType(A, Context).Klass, 1U);
+  EXPECT_EQ(Result.getJavaType(A, Context).Klass, 1U);
+  EXPECT_NE(statistics(FAM, F).find("verification skips: 0"), std::string::npos);
 }
 
 TEST_F(JavaTypeQueryTest, PhiWarmupOrderHonorsFiniteClassModel) {
@@ -491,17 +493,15 @@ TEST_F(JavaTypeQueryTest, PhiWarmupOrderHonorsFiniteClassModel) {
     // mutually recursive PHIs.
     for (JavaType Type : {TypeA, TypeB})
       EXPECT_TRUE(Type.Klass == 1U || Type.Klass == 22U);
-    if (QueryAFirst) {
-      EXPECT_EQ(TypeA.Klass, 1U);
-      EXPECT_EQ(TypeB.Klass, 1U);
-    } else {
-      EXPECT_EQ(TypeB.Klass, 1U);
-      EXPECT_EQ(TypeA.Klass, 22U);
-    }
+    auto &DT = FAM.getResult<DominatorTreeAnalysis>(*F);
+    auto &LVI = FAM.getResult<LazyValueAnalysis>(*F);
+    LVINullEdgeOracle Oracle{LVI};
+    EXPECT_EQ(TypeA, jeandle::getJavaType(A, &DT, Context, Oracle));
+    EXPECT_EQ(TypeB, jeandle::getJavaType(B, &DT, Context, Oracle));
   }
 }
 
-TEST_F(JavaTypeQueryTest, FactsBudgetCutDoesNotPublishFinalType) {
+TEST_F(JavaTypeQueryTest, FinalFactsResultsAreKeyedByInitialBudget) {
   Function *F = parse(IR);
   ASSERT_NE(F, nullptr);
   FunctionAnalysisManager FAM;
@@ -513,15 +513,15 @@ TEST_F(JavaTypeQueryTest, FactsBudgetCutDoesNotPublishFinalType) {
   {
     ScopedQueryOption<unsigned> Budget("jeandle-max-facts-join-blocks", 1);
     EXPECT_TRUE(Result.getJavaType(V, Context).isUnknown());
-    EXPECT_NE(statistics(FAM, F).find("current final type entries: 0"),
+    EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
               std::string::npos);
   }
   EXPECT_EQ(Result.getJavaType(V, Context).Klass, 22U);
-  EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 2"),
             std::string::npos);
 }
 
-TEST_F(JavaTypeQueryTest, PhiBudgetCutDoesNotPublishFinalType) {
+TEST_F(JavaTypeQueryTest, FinalPhiResultsAreKeyedByInitialBudget) {
   Function *F = parse(R"(
     define void @test(ptr "java-klass"="22" %obj) {
     entry:
@@ -539,12 +539,17 @@ TEST_F(JavaTypeQueryTest, PhiBudgetCutDoesNotPublishFinalType) {
   BasicBlock *Merge = block(*F, "merge");
   {
     ScopedQueryOption<unsigned> Budget("jeandle-max-facts-join-blocks", 0);
-    EXPECT_TRUE(Result.getJavaType(&Merge->front(), Merge->getTerminator()).isUnknown());
-    EXPECT_NE(statistics(FAM, F).find("current final type entries: 0"),
+    auto &DT = FAM.getResult<DominatorTreeAnalysis>(*F);
+    auto &LVI = FAM.getResult<LazyValueAnalysis>(*F);
+    LVINullEdgeOracle Oracle{LVI};
+    EXPECT_EQ(Result.getJavaType(&Merge->front(), Merge->getTerminator()),
+              jeandle::getJavaType(&Merge->front(), &DT,
+                                   Merge->getTerminator(), Oracle));
+    EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
               std::string::npos);
   }
   EXPECT_EQ(Result.getJavaType(&Merge->front(), Merge->getTerminator()).Klass, 22U);
-  EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 2"),
             std::string::npos);
 }
 
@@ -1334,7 +1339,7 @@ TEST_F(JavaTypeQueryTest, FullInvalidationSwitchDropsAllEntries) {
                               block(*F, "tail")->getTerminator()).Klass, 22U);
   Result.invalidate(*block(*F, "guard")->getTerminator());
   EXPECT_NE(statistics(FAM, F).find("current base entries: 0"), std::string::npos);
-  EXPECT_NE(statistics(FAM, F).find("current path facts entries: 0"),
+  EXPECT_NE(statistics(FAM, F).find("current edge facts entries: 0"),
             std::string::npos);
   EXPECT_NE(statistics(FAM, F).find("current final type entries: 0"),
             std::string::npos);

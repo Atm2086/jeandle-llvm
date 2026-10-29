@@ -47,50 +47,6 @@ STATISTIC(NumCachedJavaTypeV2BudgetExhausted,
 // identity/klass helpers and sharpen keep their original implementations.
 // Future query algorithm fixes must be reviewed for both engines.
 
-JavaTypeCacheInvalidationInfo
-JavaTypeCacheV2::invalidate(ArrayRef<Value *> Changed) {
-  JavaTypeCacheInvalidationInfo Info;
-  const size_t OldSize = BaseTypes.size();
-  if (OldSize == 0)
-    return Info;
-
-  // The old SSA use graph is a conservative superset of both type and
-  // definedness dependencies. In particular, do not stop at non-pointer
-  // instructions or at values that have no entry in BaseTypes.
-  constexpr unsigned MaxInvalidationValues = 4096;
-  constexpr unsigned MaxInvalidationUses = 4 * MaxInvalidationValues;
-  SmallPtrSet<Value *, 32> Affected;
-  SmallVector<Value *, 32> Pending(Changed.begin(), Changed.end());
-  while (!Pending.empty()) {
-    Value *V = Pending.pop_back_val();
-    if (!V || !Affected.insert(V).second)
-      continue;
-    ++Info.ValuesVisited;
-    if (Info.ValuesVisited > MaxInvalidationValues ||
-        !isa<Instruction, Argument>(V)) {
-      Info.FullClear = true;
-      break;
-    }
-    for (User *U : V->users()) {
-      if (++Info.UsesVisited > MaxInvalidationUses) {
-        Info.FullClear = true;
-        break;
-      }
-      Pending.push_back(U);
-    }
-    if (Info.FullClear)
-      break;
-  }
-
-  if (Info.FullClear)
-    clear();
-  else
-    for (Value *V : Affected)
-      BaseTypes.erase(V);
-  Info.BaseRemoved = OldSize - BaseTypes.size();
-  return Info;
-}
-
 // =============================================================================
 // Private helpers needed by the cached query
 // =============================================================================
@@ -214,44 +170,6 @@ getFullInterfaces(uintptr_t Klass,
 /// dependencies are cached only after the whole SCC has been evaluated.
 using BaseMemo = JavaTypeBaseMemo;
 using DefinedMemo = DenseMap<Value *, bool>;
-
-namespace {
-
-/// Query-local observations, not solver state or a second result cache.
-struct BaseQueryState {
-  BaseMemo &Cache;
-  CachedJavaTypeQueryInfo &Info;
-  JavaTypeCacheV2Diagnostics *Diagnostics;
-  SmallPtrSet<Value *, 32> PriorKeys;
-  size_t InitialSize;
-
-  BaseQueryState(BaseMemo &Cache, CachedJavaTypeQueryInfo &Info,
-                 JavaTypeCacheV2Diagnostics *Diagnostics)
-      : Cache(Cache), Info(Info), Diagnostics(Diagnostics),
-        InitialSize(Cache.size()) {
-    if (Diagnostics) {
-      *Diagnostics = {};
-      for (const auto &Entry : Cache)
-        PriorKeys.insert(Entry.first);
-    }
-  }
-
-  ~BaseQueryState() {
-    if (Diagnostics)
-      Diagnostics->EntriesAdded = Cache.size() - InitialSize;
-  }
-
-  void hit(Value *V) {
-    if (Diagnostics) {
-      if (PriorKeys.contains(V))
-        ++Diagnostics->PriorQueryHits;
-      else
-        ++Diagnostics->CurrentQueryHits;
-    }
-  }
-};
-
-} // namespace
 
 /// The inputs whose types bound V. Identity expressions participate in the
 /// same dependency graph as PHIs and selects, including when nested in cycles.
@@ -379,14 +297,18 @@ getDefinednessInputs(Value *V, SmallVectorImpl<Value *> &Inputs) {
 /// defined leaf, and every dependency must be supported and defined. Reverse
 /// edges first ground the cycles, then propagate unsupported/poison inputs.
 /// Only completed results enter Memo, including intermediate cycle members.
-static bool isProvenDefined(Value *V, DefinedMemo &Memo) {
-  if (auto It = Memo.find(V); It != Memo.end())
+static bool isProvenDefined(Value *V, JavaTypeDefinedCacheV2 &Defined) {
+  DefinedMemo &Memo = Defined.storage();
+  if (auto It = Memo.find(V); It != Memo.end()) {
+    Defined.recordHit();
     return It->second;
+  }
+  Defined.recordMiss();
 
   DenseMap<Value *, SmallVector<Value *, 2>> Users;
   SmallPtrSet<Value *, 32> Visited;
   SmallVector<Value *, 16> Pending{V};
-  SmallVector<Value *, 16> Defined;
+  SmallVector<Value *, 16> DefinedLeaves;
   SmallVector<Value *, 16> Unknown;
   while (!Pending.empty()) {
     Value *Current = Pending.pop_back_val();
@@ -396,10 +318,12 @@ static bool isProvenDefined(Value *V, DefinedMemo &Memo) {
     std::optional<bool> Leaf;
     if (auto It = Memo.find(Current); It != Memo.end())
       Leaf = It->second;
-    else
+    else {
+      Defined.recordNode();
       Leaf = getDefinednessInputs(Current, Inputs);
+    }
     if (Leaf) {
-      (*Leaf ? Defined : Unknown).push_back(Current);
+      (*Leaf ? DefinedLeaves : Unknown).push_back(Current);
       continue;
     }
     for (Value *Input : Inputs) {
@@ -419,14 +343,17 @@ static bool isProvenDefined(Value *V, DefinedMemo &Memo) {
     }
   };
   SmallPtrSet<Value *, 32> Grounded;
-  Propagate(Defined, Grounded);
+  Propagate(DefinedLeaves, Grounded);
   for (Value *Current : Visited)
     if (!Grounded.contains(Current))
       Unknown.push_back(Current);
   SmallPtrSet<Value *, 32> NotDefined;
   Propagate(Unknown, NotDefined);
-  for (Value *Current : Visited)
+  for (Value *Current : Visited) {
+    if (!Memo.contains(Current))
+      Defined.recordInsertion();
     Memo[Current] = !NotDefined.contains(Current);
+  }
   return Memo.lookup(V);
 }
 
@@ -543,40 +470,29 @@ struct BaseTypeNode {
 /// once by the join of the completed inputs entering it, and freeze only
 /// forwards a type that comes with a definedness proof. Neither traversal
 /// uses the C++ call stack.
-static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
-                                DefinedMemo *Defined = nullptr,
-                                BaseQueryState *State = nullptr) {
-  BaseMemo LocalMemo;
-  BaseMemo &Cache = Memo ? *Memo : LocalMemo;
-  auto *Diagnostics = State ? State->Diagnostics : nullptr;
+static JavaType getBaseJavaType(Value *V, JavaTypeBaseCacheV2 &Base,
+                                JavaTypeDefinedCacheV2 &DefinedCache) {
+  BaseMemo &Cache = Base.storage();
   if (auto It = Cache.find(V); It != Cache.end()) {
-    if (State) {
-      ++State->Info.BaseHits;
-      State->hit(V);
-    }
+    Base.recordHit(V);
     return It->second;
   }
-  if (State)
-    ++State->Info.BaseMisses;
+  Base.recordMiss();
   SmallVector<Value *, 2> Inputs;
   if (!getBaseTypeInputs(V, Inputs, /*SkipVacuousArms=*/true)) {
-    if (Diagnostics)
-      ++Diagnostics->NodesEvaluated;
+    Base.recordNode();
     JavaType Result = getBaseJavaTypeLeaf(V);
     Cache[V] = Result;
     return Result;
   }
 
   DenseMap<Value *, std::unique_ptr<BaseTypeNode>> Nodes;
-  DefinedMemo LocalDefined;
-  DefinedMemo &DefinedCache = Defined ? *Defined : LocalDefined;
   SmallVector<BaseTypeNode *, 16> Frames;
   SmallVector<BaseTypeNode *, 16> OpenNodes;
   SmallVector<BaseTypeNode *, 16> Roots;
   unsigned NextIndex = 0;
   auto Discover = [&](Value *Input) {
-    if (Diagnostics)
-      ++Diagnostics->NodesEvaluated;
+    Base.recordNode();
     auto N = std::make_unique<BaseTypeNode>();
     N->V = Input;
     N->Index = NextIndex++;
@@ -617,17 +533,11 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
     }
     if (N->NextInput != N->Inputs.size()) {
       Value *Input = N->Inputs[N->NextInput++];
-      if (Diagnostics)
-        ++Diagnostics->InputEdgesVisited;
       if (Cache.contains(Input)) {
-        if (Diagnostics)
-          ++Diagnostics->InputHits;
-        if (State)
-          State->hit(Input);
+        Base.recordInputHit(Input);
         JoinInput(N, Input);
       } else if (auto It = Nodes.find(Input); It != Nodes.end()) {
-        if (Diagnostics)
-          ++Diagnostics->OpenNodeEdges;
+        Base.recordOpenEdge();
         BaseTypeNode *InputNode = It->second.get();
         assert(InputNode->OnStack && "completed input must be cached");
         // Merge the component roots joined by this edge, including a cross
@@ -635,8 +545,7 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
         while (Roots.back()->Index > InputNode->Index)
           Roots.pop_back();
       } else {
-        if (Diagnostics)
-          ++Diagnostics->InputMisses;
+        Base.recordInputMiss();
         N->PendingChild = Discover(Input);
       }
       continue;
@@ -667,8 +576,7 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
       Cache[N->V] = Result;
       continue;
     }
-    if (Diagnostics)
-      ++Diagnostics->CyclicSCCs;
+    Base.recordCycle();
     // Every member of a cycle derives its values from the completed inputs
     // entering the cycle — PHI and select only choose among their operands —
     // so all defined observations of any member stay inside the join of
@@ -705,8 +613,7 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
         Users[Input].push_back(M);
     }
     while (!Pending.empty()) {
-      if (Diagnostics)
-        ++Diagnostics->RefinementSteps;
+      Base.recordRefinement();
       BaseTypeNode *M = Pending.pop_back_val();
       Queued.erase(M);
       JavaType Derived;
@@ -755,15 +662,13 @@ namespace {
 /// conditions, the null-edge oracle and VM callbacks, so they are constant
 /// for the lifetime of one query and safely memoized here.
 ///
-/// This V2-local context borrows BaseTypes and optional completed edge results
-/// from the caller. Definedness proofs, block/value memos, recursion state and
-/// budgets remain local. The caller maintains the two caches independently.
+/// This V2-local context borrows the caller-owned caches. Block/value memos,
+/// recursion state, observations for a new Final entry and budgets stay local.
 struct JavaTypeQueryContext {
   JavaTypeQueryContext(DominatorTree &DT, IsNullEdgeOracle NullOracle,
-                       BaseMemo &BaseTypes, BaseQueryState &BaseState,
-                       JavaTypeFactsCacheV2 *FactsCache = nullptr)
-      : DT(DT), NullOracle(NullOracle), BaseTypes(BaseTypes),
-        BaseState(BaseState), FactsCache(FactsCache) {}
+                       JavaTypeCacheV2 &Cache)
+      : DT(DT), NullOracle(NullOracle), Cache(Cache),
+        DefinedValues(Cache.Defined) {}
 
   DominatorTree &DT;
   IsNullEdgeOracle NullOracle;
@@ -771,17 +676,15 @@ struct JavaTypeQueryContext {
   /// re-encountered PHI contributes nothing. Base-type queries detect
   /// cycles with their own SCC state and do not use this set.
   SmallPtrSet<const PHINode *, 8> PhiVisited;
-  /// Complete base-type memo owned by the caller (see BaseMemo).
-  BaseMemo &BaseTypes;
-  BaseQueryState &BaseState;
-  JavaTypeFactsCacheV2 *FactsCache;
+  JavaTypeCacheV2 &Cache;
+  SmallVector<JavaTypeFinalCacheV2::NullObservation, 16> NullEdges;
   /// Completed value-dimension results. Nested PHIs can depend on the active
   /// PHI stack, so only evaluations outside that stack enter this cache.
   DenseMap<Value *, JavaType> ValueTypes;
   SmallPtrSet<Value *, 16> ValueVisited;
   unsigned ValueCycles = 0;
   /// Definedness proofs shared by base typing and CFG identity matching.
-  DefinedMemo DefinedValues;
+  JavaTypeDefinedCacheV2 &DefinedValues;
   /// Per-(value, block) evaluation state for the block dimension: absent =
   /// not yet evaluated, nullopt = currently on the evaluation stack (a cycle
   /// the back-edge rule cannot cut), engaged = the completed join. One
@@ -794,16 +697,6 @@ struct JavaTypeQueryContext {
 };
 
 } // namespace
-
-// Keep mutable cache storage private without exposing the query context or
-// implementation helpers in the public header.
-namespace llvm::jeandle {
-struct JavaTypeFactsCacheV2Access {
-  static auto &nullEdges(JavaTypeFactsCacheV2 &C) { return C.NullEdges; }
-  static auto &guards(JavaTypeFactsCacheV2 &C) { return C.Guards; }
-  static auto &stats(JavaTypeFactsCacheV2 &C) { return C.Counters; }
-};
-} // namespace llvm::jeandle
 
 /// Check if IncomingBB is reached only when Obj is null.
 /// Walks up the dominator tree from IncomingBB looking for a conditional branch
@@ -870,31 +763,33 @@ static bool computeNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
 }
 
 static bool isNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
-                       const JavaTypeQueryContext &Q) {
-  auto *C = Q.FactsCache;
-  if (!C)
-    return computeNullEdge(V, From, To, Q);
-  assert(C->getFunction() == From->getParent() &&
-         C->getFunction() == To->getParent() && "wrong facts cache owner");
-  auto &S = JavaTypeFactsCacheV2Access::stats(*C);
-  ++S.NullRequests;
-  if (C->getMode() == JavaTypeFactsCacheV2::Mode::GuardOnly) {
-    ++S.NullComputed;
-    return computeNullEdge(V, From, To, Q);
+                       JavaTypeQueryContext &Q) {
+  auto &C = Q.Cache.Facts;
+  assert(C.getFunction() == From->getParent() &&
+         C.getFunction() == To->getParent() && "wrong facts cache owner");
+  auto Remember = [&](bool Result) {
+    if (Q.Cache.finalEnabled())
+      Q.NullEdges.push_back({V, From, To, Result});
+    return Result;
+  };
+  if (C.getMode() == JavaTypeFactsCacheV2::Mode::GuardOnly) {
+    C.recordNull(false);
+    return Remember(computeNullEdge(V, From, To, Q));
   }
 
-  // Preserve the raw value identity of this helper. Its canonicalization is
-  // different from edgeGuard's and must not be folded into a shared key.
+  // Keep the actual helper argument, including when PHI incoming values have
+  // different oracle knowledge despite sharing an identity expression.
   JavaTypeFactsCacheV2::Key K{V, {From, To}};
-  auto &Memo = JavaTypeFactsCacheV2Access::nullEdges(*C);
+  auto &Memo = C.nullStorage();
   if (auto It = Memo.find(K); It != Memo.end()) {
-    ++S.NullHits;
-    return It->second;
+    C.recordNull(true);
+    return Remember(It->second);
   }
-  ++S.NullComputed;
+  C.recordNull(false);
   bool Result = computeNullEdge(V, From, To, Q);
-  Memo.try_emplace(K, Result);
-  return Result;
+  if (Memo.try_emplace(K, Result).second)
+    C.recordInsertion();
+  return Remember(Result);
 }
 
 // Condition tracing: trace from a branch condition to a check_instanceof call
@@ -981,7 +876,7 @@ static void canonicalizeI1Pair(TraceResult &R) {
 
 /// Canonicalize identity expressions for matching CFG facts. A freeze shares
 /// its operand's identity only when that operand is proven defined.
-static Value *stripCastsAndFreeze(Value *V, DefinedMemo &Defined) {
+static Value *stripCastsAndFreeze(Value *V, JavaTypeDefinedCacheV2 &Defined) {
   SmallPtrSet<Value *, 8> Visited;
   while (Visited.insert(V).second) {
     if (auto *FI = dyn_cast<FreezeInst>(V)) {
@@ -1003,7 +898,7 @@ static Value *stripCastsAndFreeze(Value *V, DefinedMemo &Defined) {
 /// with the definedness-aware freeze/identity stripping so wrappers added by
 /// later passes (freeze of the oop, returned-argument calls) still match.
 static bool isLoadKlassOf(Value *ValueToCheck, Value *QueryObj,
-                          DefinedMemo &Defined) {
+                          JavaTypeDefinedCacheV2 &Defined) {
   Value *Stripped = stripCastsAndFreeze(ValueToCheck, Defined);
   auto *Load = dyn_cast<CallBase>(Stripped);
   return Load && Load->getCalledFunction() &&
@@ -1014,7 +909,7 @@ static bool isLoadKlassOf(Value *ValueToCheck, Value *QueryObj,
 }
 
 static uintptr_t traceExactKlassGuard(Value *Cond, Value *QueryObj,
-                                      DefinedMemo &Defined) {
+                                      JavaTypeDefinedCacheV2 &Defined) {
   auto *CB = dyn_cast<CallBase>(stripCastsAndFreeze(Cond, Defined));
   Function *Callee = CB ? CB->getCalledFunction() : nullptr;
   if (!Callee || Callee->getName() != "jeandle.check_exact_klass" ||
@@ -1899,29 +1794,24 @@ static JavaType computeEdgeGuard(BasicBlock *From, BasicBlock *To, Value *V,
 
 static JavaType edgeGuard(BasicBlock *From, BasicBlock *To, Value *V,
                           JavaTypeQueryContext &Q) {
-  auto *C = Q.FactsCache;
-  if (!C)
-    return computeEdgeGuard(From, To, V, Q);
-  assert(C->getFunction() == From->getParent() &&
-         C->getFunction() == To->getParent() && "wrong facts cache owner");
-  auto &S = JavaTypeFactsCacheV2Access::stats(*C);
-  ++S.GuardRequests;
-  // Only a root trace starts with the full condition-depth allowance. A
-  // nested trace must neither consume nor publish a root result.
+  auto &C = Q.Cache.Facts;
+  assert(C.getFunction() == From->getParent() &&
+         C.getFunction() == To->getParent() && "wrong facts cache owner");
+  // Nested condition traces must keep their original depth allowance.
   if (Q.ConditionDepth != 0) {
-    ++S.GuardBypasses;
-    ++S.GuardComputed;
+    C.recordGuard(false, true);
     return computeEdgeGuard(From, To, V, Q);
   }
   JavaTypeFactsCacheV2::Key K{V, {From, To}};
-  auto &Memo = JavaTypeFactsCacheV2Access::guards(*C);
+  auto &Memo = C.guardStorage();
   if (auto It = Memo.find(K); It != Memo.end()) {
-    ++S.GuardHits;
+    C.recordGuard(true);
     return It->second;
   }
-  ++S.GuardComputed;
+  C.recordGuard(false);
   JavaType Result = computeEdgeGuard(From, To, V, Q);
-  Memo.try_emplace(K, Result);
+  if (Memo.try_emplace(K, Result).second)
+    C.recordInsertion();
   return Result;
 }
 
@@ -2040,7 +1930,7 @@ static JavaType phiValueType(PHINode *PN, JavaTypeQueryContext &Q) {
 /// Cycles and exhausted budgets fall back to the complete base bound.
 static JavaType valueDimension(Value *V, JavaTypeQueryContext &Q) {
   JavaType Base =
-      getBaseJavaType(V, &Q.BaseTypes, &Q.DefinedValues, &Q.BaseState);
+      getBaseJavaType(V, Q.Cache.Base, Q.DefinedValues);
   SmallVector<Value *, 4> Inputs;
   if (!getBaseTypeInputs(V, Inputs, /*SkipVacuousArms=*/true) || Base.Exact)
     return Base;
@@ -2087,22 +1977,57 @@ static JavaType valueDimension(Value *V, JavaTypeQueryContext &Q) {
 JavaType jeandle::getCachedJavaTypeV2(Value *V, DominatorTree *DT,
                                      Instruction *Context,
                                      IsNullEdgeOracle IsNullEdge,
-                                     JavaTypeCacheV2 &Cache,
-                                     CachedJavaTypeQueryInfo &Info,
-                                     JavaTypeCacheV2Diagnostics *Diagnostics,
-                                     JavaTypeFactsCacheV2 *FactsCache) {
+                                     JavaTypeCacheV2 &Cache) {
   assert(getVMCallbacks() && getVMCallbacks()->IsSubtype &&
          "VMCallbacks must be set");
-  Info = {};
-  BaseQueryState State(Cache.BaseTypes, Info, Diagnostics);
+  if (Context)
+    Cache.bind(*Context->getFunction());
+  else if (auto *I = dyn_cast<Instruction>(V))
+    Cache.bind(*I->getFunction());
+  else if (auto *A = dyn_cast<Argument>(V))
+    Cache.bind(*A->getParent());
+
   if (!DT || !Context) {
-    DefinedMemo Defined;
-    return getBaseJavaType(V, &Cache.BaseTypes, &Defined, &State);
+    Cache.Base.beginQuery();
+    auto Finish = make_scope_exit([&] { Cache.Base.endQuery(); });
+    return getBaseJavaType(V, Cache.Base, Cache.Defined);
   }
 
-  assert((!FactsCache || FactsCache->getFunction() == Context->getFunction()) &&
-         "wrong facts cache owner");
-  JavaTypeQueryContext Q{*DT, IsNullEdge, Cache.BaseTypes, State, FactsCache};
+  JavaTypeQueryContext Q{*DT, IsNullEdge, Cache};
+  unsigned Budget = getFactsJoinBudget();
+  BasicBlock *BB = Context->getParent();
+  if (Cache.finalEnabled()) {
+    if (auto *Entry = Cache.Final.lookup(V, BB, Budget)) {
+      bool Valid = true;
+      if (Entry->NeedsValidation) {
+        // IR dependencies have survived selective invalidation, but an oracle
+        // reset can change precision. Recheck exactly the null-edge decisions
+        // used by this top-level query before reusing its final result.
+        for (const auto &Observation : Entry->NullEdges)
+          if (computeNullEdge(Observation.V, Observation.From, Observation.To,
+                              Q) != Observation.Result) {
+            Valid = false;
+            break;
+          }
+        Cache.Final.recordValidation(Valid);
+      }
+      if (Valid) {
+        Entry->NeedsValidation = false;
+        Cache.Final.recordHit();
+        return Entry->Type;
+      }
+      Cache.Final.erase(V, BB, Budget);
+    }
+    Cache.Final.recordMiss();
+  }
+
+  Cache.Base.beginQuery();
+  auto Finish = make_scope_exit([&] { Cache.Base.endQuery(); });
   JavaType T = valueDimension(V, Q);
-  return typeIntersect(T, factsAt(V, Context->getParent(), Q));
+  JavaType Result = typeIntersect(T, factsAt(V, BB, Q));
+  // This is the only publication/read point for Final. Never replace a
+  // recursive valueDimension/factsAt evaluation with a top-level result.
+  if (Cache.finalEnabled())
+    Cache.Final.insert(V, BB, Budget, Result, Q.NullEdges);
+  return Result;
 }

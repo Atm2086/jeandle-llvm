@@ -2,27 +2,20 @@
 
 这个方案在 Facts 求解过程中复用两类边信息：完整根调用的 `edgeGuard` 结果，以及满足稳定 oracle 契约时的完整 `isNullEdge` 判断。它保持 `factsAt` 的遍历、查询内 memo、预算和循环处理方式，避免直接把依赖当前查询状态的 `(Value, BasicBlock)` 完整 Facts 结果跨查询发布。
 
-实现位于独立的 [CachedJavaTypeV2.cpp](../../lib/Analysis/Jeandle/CachedJavaTypeV2.cpp) 和 [CachedJavaTypeV2.h](../../include/llvm/Analysis/Jeandle/CachedJavaTypeV2.h)。原版 [JavaType.cpp](../../lib/IR/Jeandle/JavaType.cpp) 和公共 `JavaType` 定义保持不变。缓存由调用方持有并显式传入；当前没有接入生产 pass。
+实现位于独立的 [CachedJavaTypeV2.cpp](../../lib/Analysis/Jeandle/CachedJavaTypeV2.cpp) 和 [CachedJavaTypeV2.h](../../include/llvm/Analysis/Jeandle/CachedJavaTypeV2.h)。原版 [JavaType.cpp](../../lib/IR/Jeandle/JavaType.cpp) 和公共 `JavaType` 定义保持不变。缓存由调用方持有并通过聚合对象传入；当前通过 JavaTypeAnalysis 接入消费者 pass。
 
-## 1. 接口和保存内容
+## 1. 当前接口和保存内容
 
-调用方为一个函数创建 `JavaTypeFactsCacheV2(Function &, Mode)`。`Mode` 在构造时确定，默认是 `GuardOnly`；`StableOracleEpoch` 是需要额外契约的可选模式。`getCachedJavaTypeV2` 的末尾增加可选的 Facts cache 指针，省略或传 `nullptr` 时不开启本层缓存。Base cache 和 Facts cache 分开持有、分别管理。
+四类缓存现由 `JavaTypeCacheV2` 聚合持有，定义移至 `JavaTypeCacheV2.h/.cpp`；查询入口只接收一个总 cache 引用。Facts 仍是独立成员，保留自己的模式、失效和计数。`JavaTypeAnalysis` 已切换到 V2，并显式使用稳定 oracle 模式。
 
 ```cpp
-JavaTypeCacheV2 BaseCache;
-JavaTypeFactsCacheV2 FactsCache(F); // 默认 GuardOnly。
+JavaTypeCacheV2 Cache(F, JavaTypeFactsCacheV2::Mode::StableOracleEpoch);
+Cache.setStatsEnabled(true); // 默认关闭；Analysis由统计开关控制。
 LVINullEdgeOracle Oracle{LVI};
-CachedJavaTypeQueryInfo Info;
-JavaType T = getCachedJavaTypeV2(V, &DT, Context, Oracle, BaseCache, Info,
-                               nullptr, &FactsCache);
+JavaType T = getCachedJavaTypeV2(V, &DT, Context, Oracle, Cache);
 ```
 
-只有能够保证后文稳定 oracle epoch 的调用者，才选择：
-
-```cpp
-JavaTypeFactsCacheV2 FactsCache(
-    F, JavaTypeFactsCacheV2::Mode::StableOracleEpoch);
-```
+默认 `GuardOnly` 不缓存 null 判断，也不启用会跳过 oracle 的 Final；Base、Defined和guard仍可复用。详细生命周期及 Final 选择性失效见 [JavaTypeCacheV2Design.md](JavaTypeCacheV2Design.md)。
 
 两张表都使用原 helper 调用点的 `(V, From, To)` 作为 key。这里的 `V` 是原算法传给 helper 的实际值；不为了增加命中率，另行统一各 helper 不同的 casts/freeze/identity 归一化规则。
 
@@ -48,7 +41,7 @@ JavaTypeFactsCacheV2 FactsCache(
 
 本方案每次仍执行原 `factsAt` 的 seed cuts、`Processed` 查找/进行中标记、预算递减、按原顺序访问前驱、backedge/null-edge 判断、递归、guard 合并及 join。命中边缓存不会直接跳过整个 CFG 子图，也不会以固定 cost 扣减预算。这样，跨查询复用发生在独立的边操作层，查询内状态仍由原算法逐步建立。
 
-`DefinedValues` 仍是查询内证明缓存。guard 命中会省掉部分证明调用，因此它的键覆盖可以与无共享缓存的执行不同；每条实际保存的证明仍应等于相同输入的独立证明。不能为了要求所有容器逐字相同而恢复已经省掉的工作。
+`DefinedValues` 现在引用聚合对象中的跨查询证明缓存，证明工作图仍在查询内。guard 命中会省掉部分证明调用，因此它的键覆盖可以与无共享缓存的执行不同；每条实际保存的证明仍应等于相同输入的独立证明。不能为了要求所有容器逐字相同而恢复已经省掉的工作。
 
 ## 3. 启用前需要确认的条件
 
@@ -158,9 +151,9 @@ Base 的选择性失效不能自动满足 Facts 的失效规则。类型 guard �
 - oracle 入口、实际 LVI solve/work items、缓存维护成本；
 - consumer 时间及完整 pipeline 时间。
 
-目前没有证明运行时间提升，也没有生产 pass 接入数据。源码保留和语义回归通过以后，仍需真实 workload 性能测量才能决定是否默认启用 StableOracleEpoch 或进一步研究细粒度失效。
+以下时间收益限制仍成立：接口接入和语义回归不等同于真实 workload 性能提升。Analysis使用当前LVI稳定契约启用StableOracleEpoch，失效及重验证见四缓存设计文档。
 
-## 7. 保留版验证结果
+## 7. 第一阶段保留版验证结果（历史）
 
 已执行：
 

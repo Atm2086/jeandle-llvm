@@ -1,0 +1,289 @@
+//===- JavaTypeCacheV2.h - Owned Java type query caches ---------*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_ANALYSIS_JEANDLE_JAVATYPECACHEV2_H
+#define LLVM_ANALYSIS_JEANDLE_JAVATYPECACHEV2_H
+
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/Jeandle/CachedJavaType.h"
+
+namespace llvm {
+class Function;
+}
+
+namespace llvm::jeandle {
+
+using JavaTypeBaseMemo = DenseMap<Value *, JavaType>;
+using JavaTypeDefinedMemo = DenseMap<Value *, bool>;
+
+/// Counters belong to the cache being observed and survive clear(). They are
+/// disabled by default; enable them before the measured queries/notifications.
+struct JavaTypeCacheV2Stats {
+  uint64_t Hits = 0;
+  uint64_t Misses = 0;
+  uint64_t EntriesAdded = 0;
+  uint64_t EntriesRemoved = 0;
+  uint64_t Invalidations = 0;
+  uint64_t Clears = 0;
+};
+
+struct JavaTypeCacheV2InvalidationInfo : JavaTypeCacheInvalidationInfo {
+  size_t DefinedRemoved = 0;
+  size_t DefinedSlotsScanned = 0;
+};
+
+/// Completed context-independent bounds. The solver also uses this storage
+/// while closing an SCC: never invalidate or evict during a running query.
+class LLVM_ABI JavaTypeBaseCacheV2 {
+public:
+  struct Stats : JavaTypeCacheV2Stats {
+    uint64_t InputHits = 0;
+    uint64_t InputMisses = 0;
+    uint64_t PriorQueryHits = 0;
+    uint64_t CurrentQueryHits = 0;
+    uint64_t NodesEvaluated = 0;
+    uint64_t InputEdgesVisited = 0;
+    uint64_t OpenNodeEdges = 0;
+    uint64_t CyclicSCCs = 0;
+    uint64_t RefinementSteps = 0;
+  };
+
+private:
+  friend class JavaTypeCacheV2;
+  JavaTypeBaseMemo Memo;
+  Stats Counters;
+  bool StatsEnabled = false;
+  bool DetailedStats = false;
+  SmallPtrSet<Value *, 32> PriorKeys;
+  size_t InitialSize = 0;
+
+  void recordReuse(Value *V);
+
+public:
+  JavaTypeBaseMemo &storage() { return Memo; }
+  size_t size() const { return Memo.size(); }
+  const Stats &getStats() const { return Counters; }
+  void resetStats() { Counters = {}; }
+  void setStatsEnabled(bool Enabled) { StatsEnabled = Enabled; }
+  void enableDetailedStats(bool Enabled) { DetailedStats = Enabled; }
+  void beginQuery();
+  void endQuery();
+  void recordHit(Value *V);
+  void recordMiss();
+  void recordNode();
+  void recordInputHit(Value *V);
+  void recordInputMiss();
+  void recordOpenEdge();
+  void recordCycle();
+  void recordRefinement();
+  void clear();
+
+  /// Affected is the complete old SSA user closure collected by the owner.
+  size_t invalidate(ArrayRef<Value *> Affected, bool CFGChanged,
+                    JavaTypeBaseInvalidationMode Mode, size_t &SlotsScanned);
+};
+
+/// Completed context-independent definedness proofs, including negative proofs
+/// ("not proven defined"). No worklist or unfinished proof survives a query.
+class LLVM_ABI JavaTypeDefinedCacheV2 {
+public:
+  struct Stats : JavaTypeCacheV2Stats {
+    uint64_t NodesEvaluated = 0;
+  };
+
+private:
+  friend class JavaTypeCacheV2;
+  JavaTypeDefinedMemo Memo;
+  Stats Counters;
+  bool StatsEnabled = false;
+
+public:
+  JavaTypeDefinedMemo &storage() { return Memo; }
+  size_t size() const { return Memo.size(); }
+  const Stats &getStats() const { return Counters; }
+  void resetStats() { Counters = {}; }
+  void setStatsEnabled(bool Enabled) { StatsEnabled = Enabled; }
+  void recordHit();
+  void recordMiss();
+  void recordNode();
+  void recordInsertion(size_t Count = 1);
+  void clear();
+  size_t invalidate(ArrayRef<Value *> Affected, bool CFGChanged,
+                    JavaTypeBaseInvalidationMode Mode, size_t &SlotsScanned);
+};
+
+/// Complete root edge guards and optional null-edge decisions. This cache has
+/// a deliberately separate invalidation policy from Base and Defined.
+class LLVM_ABI JavaTypeFactsCacheV2 {
+public:
+  enum class Mode { GuardOnly, StableOracleEpoch };
+  using Key = std::pair<Value *, std::pair<BasicBlock *, BasicBlock *>>;
+  struct Stats : JavaTypeCacheV2Stats {
+    uint64_t NullRequests = 0;
+    uint64_t NullHits = 0;
+    uint64_t NullComputed = 0;
+    uint64_t GuardRequests = 0;
+    uint64_t GuardHits = 0;
+    uint64_t GuardComputed = 0;
+    uint64_t GuardBypasses = 0;
+  };
+
+private:
+  friend class JavaTypeCacheV2;
+  Function *Owner;
+  Mode CacheMode;
+  DenseMap<Key, bool> NullEdges;
+  DenseMap<Key, JavaType> Guards;
+  Stats Counters;
+  bool StatsEnabled = false;
+
+public:
+  explicit JavaTypeFactsCacheV2(Function *F = nullptr,
+                              Mode M = Mode::GuardOnly)
+      : Owner(F), CacheMode(M) {}
+  explicit JavaTypeFactsCacheV2(Function &F, Mode M = Mode::GuardOnly)
+      : JavaTypeFactsCacheV2(&F, M) {}
+  void bind(Function &F);
+  Function *getFunction() const { return Owner; }
+  Mode getMode() const { return CacheMode; }
+  auto &nullStorage() { return NullEdges; }
+  auto &guardStorage() { return Guards; }
+  size_t nullSize() const { return NullEdges.size(); }
+  size_t guardSize() const { return Guards.size(); }
+  size_t size() const { return nullSize() + guardSize(); }
+  const Stats &getStats() const { return Counters; }
+  void resetStats() { Counters = {}; }
+  void setStatsEnabled(bool Enabled) { StatsEnabled = Enabled; }
+  void recordNullRequest();
+  void recordNullHit();
+  void recordNullComputed();
+  void recordGuardRequest();
+  void recordGuardHit();
+  void recordGuardComputed();
+  void recordGuardBypass();
+  void recordNull(bool Hit);
+  void recordGuard(bool Hit, bool Bypass = false);
+  void recordInsertion(size_t Count = 1);
+  void clear();
+  size_t invalidate();
+};
+
+/// A completed top-level query only. Its key includes the initial budget;
+/// recursive facts/value results never enter this cache. Dependencies cover a
+/// conservative region independently of the warm state of the other caches.
+/// Null observations are retained in call order. After an oracle notification,
+/// they must be revalidated before reusing the result.
+class LLVM_ABI JavaTypeFinalCacheV2 {
+public:
+  using Key = std::pair<Value *, std::pair<BasicBlock *, unsigned>>;
+  struct NullObservation {
+    Value *V;
+    BasicBlock *From;
+    BasicBlock *To;
+    bool Result;
+  };
+  struct Entry {
+    JavaType Type;
+    SmallVector<NullObservation, 8> NullEdges;
+    bool NeedsValidation = false;
+    SmallVector<Value *, 8> Values;
+    SmallVector<BasicBlock *, 8> Blocks;
+  };
+  struct Stats : JavaTypeCacheV2Stats {
+    uint64_t Validations = 0;
+    uint64_t ValidationFailures = 0;
+    uint64_t Bypasses = 0;
+  };
+
+private:
+  friend class JavaTypeCacheV2;
+  DenseMap<Key, Entry> Memo;
+  DenseMap<Value *, DenseSet<Key>> ByValue;
+  DenseMap<BasicBlock *, DenseSet<Key>> ByBlock;
+  Stats Counters;
+  bool StatsEnabled = false;
+
+  void erase(Key K);
+
+public:
+  size_t size() const { return Memo.size(); }
+  const Stats &getStats() const { return Counters; }
+  void resetStats() { Counters = {}; }
+  void setStatsEnabled(bool Enabled) { StatsEnabled = Enabled; }
+  Entry *lookup(Value *V, BasicBlock *BB, unsigned Budget);
+  bool insert(Value *V, BasicBlock *BB, unsigned Budget, const JavaType &Type,
+              ArrayRef<NullObservation> Observations);
+  void erase(Value *V, BasicBlock *BB, unsigned Budget) {
+    erase(Key{V, {BB, Budget}});
+  }
+  void recordHit();
+  void recordMiss();
+  void recordValidation();
+  void recordValidation(bool Success);
+  void recordValidationFailure();
+  void recordBypass();
+  void clear();
+  void notifyOracleChanged();
+  size_t invalidate(ArrayRef<Value *> Affected,
+                    ArrayRef<BasicBlock *> AffectedBlocks, bool CFGChanged);
+};
+
+/// Function-owned aggregate; each kind of cache keeps its own memo, counters
+/// and invalidation policy. All notifications precede mutation/RAUW/deletion.
+/// Also notify destination blocks before insertion/movement. CFG changes must
+/// set CFGChanged; unknown changes and VM/type-universe changes require clear.
+/// Oracle maintenance requires notifyOracleChanged(), even without IR changes.
+/// A StableOracleEpoch permits skipping repeat oracle calls between such
+/// notifications; arbitrary changing callbacks must use GuardOnly.
+class LLVM_ABI JavaTypeCacheV2 {
+  Function *Owner;
+  bool EnableFinal;
+
+public:
+  using Mode = JavaTypeFactsCacheV2::Mode;
+  JavaTypeBaseCacheV2 Base;
+  JavaTypeDefinedCacheV2 Defined;
+  JavaTypeFactsCacheV2 Facts;
+  JavaTypeFinalCacheV2 Final;
+
+  explicit JavaTypeCacheV2(Function *F = nullptr, Mode M = Mode::GuardOnly,
+                           bool EnableFinal = true)
+      : Owner(F), EnableFinal(EnableFinal), Facts(F, M) {}
+  explicit JavaTypeCacheV2(Function &F, Mode M = Mode::GuardOnly,
+                           bool EnableFinal = true)
+      : JavaTypeCacheV2(&F, M, EnableFinal) {}
+  void bind(Function &F);
+  Function *getFunction() const { return Owner; }
+  Mode getMode() const { return Facts.getMode(); }
+  void setFinalEnabled(bool Enabled) { EnableFinal = Enabled; }
+  bool finalEnabled() const {
+    return EnableFinal && getMode() == Mode::StableOracleEpoch;
+  }
+  void setStatsEnabled(bool Enabled);
+  void setDetailedStatsEnabled(bool Enabled) {
+    Base.enableDetailedStats(Enabled);
+  }
+  void resetStats();
+  void clear();
+  void notifyOracleChanged();
+  size_t baseSize() const { return Base.size(); }
+  size_t definedSize() const { return Defined.size(); }
+  size_t pathFactsSize() const { return Facts.size(); }
+  size_t finalTypesSize() const { return Final.size(); }
+  JavaTypeCacheV2InvalidationInfo
+  invalidate(ArrayRef<Value *> Changed, bool CFGChanged = false,
+             JavaTypeBaseInvalidationMode Mode =
+                 JavaTypeBaseInvalidationMode::SelectiveKeys);
+};
+
+} // namespace llvm::jeandle
+
+#endif // LLVM_ANALYSIS_JEANDLE_JAVATYPECACHEV2_H
