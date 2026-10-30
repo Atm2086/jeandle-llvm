@@ -1340,7 +1340,7 @@ TEST_F(CachedJavaTypeV2Test, DefinedNegativeProofRefreshesAfterAttributeEdit) {
             fresh(First));
 }
 
-TEST_F(CachedJavaTypeV2Test, FinalKeysIncludeBudgetAndOnlyPublishTopLevelResults) {
+TEST_F(CachedJavaTypeV2Test, FinalReuseIgnoresBudgetAndOnlyPublishesTopLevelResults) {
   auto M = parse(R"IR(
     declare i1 @jeandle.check_instanceof(ptr, ptr nonnull)
     define ptr @test(ptr %obj) {
@@ -1377,26 +1377,46 @@ TEST_F(CachedJavaTypeV2Test, FinalKeysIncludeBudgetAndOnlyPublishTopLevelResults
   auto Restore = make_scope_exit([&] { Budget = Saved; });
   Function &F = *M->getFunction("test");
   DominatorTree DT(F);
-  JavaTypeCacheV2 Cache(F, FactsCacheMode::StableOracleEpoch);
-  Cache.setStatsEnabled(true);
   BasicBlock *At = findV2FactsTestBlock(F, "query");
-  for (unsigned Limit : {1U, 128U, 1U, 128U}) {
-    SCOPED_TRACE(Limit);
-    Budget = Limit;
+  for (unsigned InitialLimit : {1U, 128U}) {
+    SCOPED_TRACE(InitialLimit);
+    Budget = InitialLimit;
+    JavaTypeCacheV2 Cache(F, FactsCacheMode::StableOracleEpoch);
+    Cache.setStatsEnabled(true);
+    unsigned OracleCalls = 0;
+    auto Oracle = [&](Value *, BasicBlock *, BasicBlock *) {
+      ++OracleCalls;
+      return false;
+    };
     JavaType Expected = getJavaType(F.getArg(0), &DT, At->getTerminator(),
                                     noNullEdge);
+    if (InitialLimit == 1)
+      EXPECT_TRUE(Expected.isUnknown());
+    else
+      EXPECT_EQ(Expected, JavaType(9, false));
     EXPECT_EQ(getCachedJavaTypeV2(F.getArg(0), &DT, At->getTerminator(),
-                                  noNullEdge, Cache), Expected);
-    uint64_t Hits = Cache.Final.getStats().Hits;
-    uint64_t BaseMisses = Cache.Base.getStats().Misses;
-    // Different instructions in one block have the same contextual semantics.
-    EXPECT_EQ(getCachedJavaTypeV2(F.getArg(0), &DT, &At->front(), noNullEdge,
-                                  Cache), Expected);
-    EXPECT_EQ(Cache.Final.getStats().Hits, Hits + 1);
-    EXPECT_EQ(Cache.Base.getStats().Misses, BaseMisses);
+                                  Oracle, Cache), Expected);
+    unsigned CallsAfterMiss = OracleCalls;
+    for (unsigned Limit : {0U, 1U, 128U}) {
+      SCOPED_TRACE(Limit);
+      Budget = Limit;
+      uint64_t Hits = Cache.Final.getStats().Hits;
+      uint64_t BaseMisses = Cache.Base.getStats().Misses;
+      // Solving budgets do not invalidate an answer. Both precise and
+      // conservative answers remain reusable without repeating oracle work.
+      EXPECT_EQ(getCachedJavaTypeV2(F.getArg(0), &DT, At->getTerminator(),
+                                    Oracle, Cache), Expected);
+      // Different instructions in one block share the same Final entry.
+      EXPECT_EQ(getCachedJavaTypeV2(F.getArg(0), &DT, &At->front(), Oracle,
+                                    Cache), Expected);
+      EXPECT_EQ(Cache.Final.getStats().Hits, Hits + 2);
+      EXPECT_EQ(Cache.Base.getStats().Misses, BaseMisses);
+      EXPECT_EQ(OracleCalls, CallsAfterMiss);
+      EXPECT_EQ(Cache.finalTypesSize(), 1U);
+    }
   }
-  EXPECT_EQ(Cache.finalTypesSize(), 2U);
 
+  Budget = 128;
   Function &Cycle = *M->getFunction("cycle");
   DominatorTree CycleDT(Cycle);
   BasicBlock *Exit = findV2FactsTestBlock(Cycle, "exit");

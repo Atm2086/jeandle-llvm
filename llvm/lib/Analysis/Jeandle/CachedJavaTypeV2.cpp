@@ -1994,10 +1994,9 @@ JavaType jeandle::getCachedJavaTypeV2(Value *V, DominatorTree *DT,
   }
 
   JavaTypeQueryContext Q{*DT, IsNullEdge, Cache};
-  unsigned Budget = getFactsJoinBudget();
   BasicBlock *BB = Context->getParent();
   if (Cache.finalEnabled()) {
-    if (auto *Entry = Cache.Final.lookup(V, BB, Budget)) {
+    if (auto *Entry = Cache.Final.lookup(V, BB)) {
       bool Valid = true;
       if (Entry->NeedsValidation) {
         // IR dependencies have survived selective invalidation, but an oracle
@@ -2016,7 +2015,7 @@ JavaType jeandle::getCachedJavaTypeV2(Value *V, DominatorTree *DT,
         Cache.Final.recordHit();
         return Entry->Type;
       }
-      Cache.Final.erase(V, BB, Budget);
+      Cache.Final.erase(V, BB);
     }
     Cache.Final.recordMiss();
   }
@@ -2028,6 +2027,6 @@ JavaType jeandle::getCachedJavaTypeV2(Value *V, DominatorTree *DT,
   // This is the only publication/read point for Final. Never replace a
   // recursive valueDimension/factsAt evaluation with a top-level result.
   if (Cache.finalEnabled())
-    Cache.Final.insert(V, BB, Budget, Result, Q.NullEdges);
+    Cache.Final.insert(V, BB, Result, Q.NullEdges);
   return Result;
 }

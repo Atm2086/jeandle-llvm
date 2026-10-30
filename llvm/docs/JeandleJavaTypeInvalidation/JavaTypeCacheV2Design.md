@@ -14,7 +14,7 @@
 | `Base` / `JavaTypeBaseCacheV2` | `Value* → JavaType` 的基础类型结果 | 相同 IR、VM 类型环境；修改后可保留不受影响的值 |
 | `Defined` / `JavaTypeDefinedCacheV2` | `Value* → bool` 的完成 definedness 证明 | 同上；`false` 表示未能证明 defined |
 | `Facts` / `JavaTypeFactsCacheV2` | `(V, From, To)` 的根 guard 和完整 null-edge 判断 | 本次有效期内跨查询复用；IR 修改后清空 |
-| `Final` / `JavaTypeFinalCacheV2` | `(V, ContextBB, InitialBudget)` 的完整顶层查询结果 | 依赖未变，且所需 oracle 判断仍有效 |
+| `Final` / `JavaTypeFinalCacheV2` | `(V, ContextBB)` 的完整顶层查询结果 | 依赖未变，且所需 oracle 判断仍有效 |
 
 最外层只传入一个缓存引用：
 
@@ -26,8 +26,11 @@ JavaType getCachedJavaTypeV2(Value *V, DominatorTree *DT,
 
 预算、递归栈、SCC 工作图、`Processed` 和 `ValueTypes` 仍是单次查询状态。
 只有完整顶层结果进入 Final；递归中的 `valueDimension` / `factsAt`
-不读取 Final。截断结果也只按其初始预算复用，因此提高预算会使用另一个键。
-Context 用所在块作键，对应当前算法按块求路径事实的语义。
+不读取 Final。预算只限制底层求解工作，不参与 Final 的键及查找、插入、
+删除接口。Context 用所在块作键，对应当前算法按块求路径事实的语义。
+改变求解预算不会使已有答案失效，也不会新增另一个 Final 条目。
+当前仍允许缓存底层截断后返回的保守顶层答案；提高预算不会自动细化
+这样的缓存答案，需要重新求解时可显式清空 Final（Analysis 使用 clear）。
 
 每个缓存类拥有自己的累计 `Stats`，默认关闭。聚合类提供统一开关及
 `resetStats()`；`clear()` 清结果但保留累计计数。Base 的跨查询命中细分
@@ -100,6 +103,8 @@ CFG 结构变化可能引入旧区域外的新前驱，当前通知协议无法�
 DT 仍由调用方在下一次查询前更新。完整 `clear()` 清四类缓存及 LVI。
 `-jeandle-verify-java-type-cache` 严格比较原版查询的完整结果，
 不再因为预算截断或 PHI 环跳过验证。
+该严格相等检查用于固定求解配置；测试若主动更改预算，已有缓存的精度
+可能不同于新预算下的冷查询。需要继续做严格冷查询对照时应先清缓存。
 
 普通 IR API 不会自动调用 JavaType 的失效方法。这里有两种不同入口：
 
@@ -132,7 +137,7 @@ Result.invalidate(Changed);
 ## 验证与限制
 
 四类缓存的语义回归覆盖 Defined 正/负证明复用及失效、Base 为空时的
-Defined 处理、Final 的预算键和顶层发布、热子缓存下的依赖、无关分支
+Defined 处理、Final 跨预算复用同一条目和顶层发布、热子缓存下的依赖、无关分支
 保留、oracle 维护重验证、真实 LVI 的 assume 修改和 Analysis 生命周期。
 原版 JavaType、原版结构 CSV、直接 V1 实现保持不变。
 

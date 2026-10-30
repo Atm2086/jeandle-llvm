@@ -176,14 +176,15 @@ public:
   size_t invalidate();
 };
 
-/// A completed top-level query only. Its key includes the initial budget;
-/// recursive facts/value results never enter this cache. Dependencies cover a
+/// A completed top-level query only, keyed by value and context block. Query
+/// budgets limit solving work, not reuse of a valid result. Recursive facts/value
+/// results never enter this cache. Dependencies cover a
 /// conservative region independently of the warm state of the other caches.
 /// Null observations are retained in call order. After an oracle notification,
 /// they must be revalidated before reusing the result.
 class LLVM_ABI JavaTypeFinalCacheV2 {
 public:
-  using Key = std::pair<Value *, std::pair<BasicBlock *, unsigned>>;
+  using Key = std::pair<Value *, BasicBlock *>;
   struct NullObservation {
     Value *V;
     BasicBlock *From;
@@ -218,12 +219,10 @@ public:
   const Stats &getStats() const { return Counters; }
   void resetStats() { Counters = {}; }
   void setStatsEnabled(bool Enabled) { StatsEnabled = Enabled; }
-  Entry *lookup(Value *V, BasicBlock *BB, unsigned Budget);
-  bool insert(Value *V, BasicBlock *BB, unsigned Budget, const JavaType &Type,
+  Entry *lookup(Value *V, BasicBlock *BB);
+  bool insert(Value *V, BasicBlock *BB, const JavaType &Type,
               ArrayRef<NullObservation> Observations);
-  void erase(Value *V, BasicBlock *BB, unsigned Budget) {
-    erase(Key{V, {BB, Budget}});
-  }
+  void erase(Value *V, BasicBlock *BB) { erase(Key{V, BB}); }
   void recordHit();
   void recordMiss();
   void recordValidation();

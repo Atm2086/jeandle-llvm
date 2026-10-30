@@ -341,13 +341,12 @@ size_t JavaTypeFactsCacheV2::invalidate() {
 }
 
 JavaTypeFinalCacheV2::Entry *
-JavaTypeFinalCacheV2::lookup(Value *V, BasicBlock *BB, unsigned Budget) {
-  auto It = Memo.find(Key{V, {BB, Budget}});
+JavaTypeFinalCacheV2::lookup(Value *V, BasicBlock *BB) {
+  auto It = Memo.find(Key{V, BB});
   return It == Memo.end() ? nullptr : &It->second;
 }
 
-bool JavaTypeFinalCacheV2::insert(Value *V, BasicBlock *BB, unsigned Budget,
-                                const JavaType &Type,
+bool JavaTypeFinalCacheV2::insert(Value *V, BasicBlock *BB, const JavaType &Type,
                                 ArrayRef<NullObservation> Observations) {
   Entry NewEntry;
   NewEntry.Type = Type;
@@ -356,7 +355,7 @@ bool JavaTypeFinalCacheV2::insert(Value *V, BasicBlock *BB, unsigned Budget,
     recordBypass();
     return false;
   }
-  Key K{V, {BB, Budget}};
+  Key K{V, BB};
   erase(K);
   for (Value *Dependency : NewEntry.Values)
     ByValue[Dependency].insert(K);

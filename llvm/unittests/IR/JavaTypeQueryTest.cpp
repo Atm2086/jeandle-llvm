@@ -501,7 +501,7 @@ TEST_F(JavaTypeQueryTest, PhiWarmupOrderHonorsFiniteClassModel) {
   }
 }
 
-TEST_F(JavaTypeQueryTest, FinalFactsResultsAreKeyedByInitialBudget) {
+TEST_F(JavaTypeQueryTest, FinalFactsResultsSurviveBudgetChangesUntilCleared) {
   Function *F = parse(IR);
   ASSERT_NE(F, nullptr);
   FunctionAnalysisManager FAM;
@@ -516,12 +516,24 @@ TEST_F(JavaTypeQueryTest, FinalFactsResultsAreKeyedByInitialBudget) {
     EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
               std::string::npos);
   }
+  // Raising the solving budget does not discard a still-valid cached answer.
+  EXPECT_TRUE(Result.getJavaType(V, Context).isUnknown());
+  EXPECT_NE(statistics(FAM, F).find("final type hits: 1"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
+            std::string::npos);
+  Result.clear();
   EXPECT_EQ(Result.getJavaType(V, Context).Klass, 22U);
-  EXPECT_NE(statistics(FAM, F).find("current final type entries: 2"),
+  // An already-computed precise answer needs no new solving budget either.
+  {
+    ScopedQueryOption<unsigned> Budget("jeandle-max-facts-join-blocks", 0);
+    EXPECT_EQ(Result.getJavaType(V, Context).Klass, 22U);
+  }
+  EXPECT_NE(statistics(FAM, F).find("final type hits: 2"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
             std::string::npos);
 }
 
-TEST_F(JavaTypeQueryTest, FinalPhiResultsAreKeyedByInitialBudget) {
+TEST_F(JavaTypeQueryTest, FinalPhiResultsReuseOneEntryAcrossBudgets) {
   Function *F = parse(R"(
     define void @test(ptr "java-klass"="22" %obj) {
     entry:
@@ -549,7 +561,8 @@ TEST_F(JavaTypeQueryTest, FinalPhiResultsAreKeyedByInitialBudget) {
               std::string::npos);
   }
   EXPECT_EQ(Result.getJavaType(&Merge->front(), Merge->getTerminator()).Klass, 22U);
-  EXPECT_NE(statistics(FAM, F).find("current final type entries: 2"),
+  EXPECT_NE(statistics(FAM, F).find("final type hits: 1"), std::string::npos);
+  EXPECT_NE(statistics(FAM, F).find("current final type entries: 1"),
             std::string::npos);
 }
 
