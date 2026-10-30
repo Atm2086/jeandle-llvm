@@ -7,12 +7,73 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/Jeandle/LVINullEdgeOracle.h"
+#include "llvm/Analysis/Jeandle/JavaTypeAnalysisStats.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/JavaType.h"
+#include "llvm/Support/CommandLine.h"
+
+#include <chrono>
 
 using namespace llvm;
+
+namespace {
+
+/// E0 experiment: answer every null-edge query negatively, i.e. keep every
+/// edge. The optimization stays sound (keeping an edge is always sound) and
+/// the run measures how much the oracle actually costs. It is also the
+/// "budget = 0" shape of the oracle-call budget.
+cl::opt<bool> DisableNullEdgeOracle(
+    "jeandle-disable-null-edge-oracle",
+    cl::desc("Answer every null-edge oracle query negatively (keep every edge)"),
+    cl::Hidden, cl::init(false));
+
+/// S4 level 2: block-level null proof.
+///
+/// The edge-level query (level 3) asks LVI for the value of V on the edge
+/// FromBB -> ToBB. V is an SSA value, so a null constant at the *end* of
+/// FromBB already proves V null on every edge out of FromBB; the block-level
+/// query (getConstant) needs one getValueInBlock instead of the
+/// getEdgeValueLocal + getBlockValue pair the edge query performs.
+///
+/// The switch is off by default: the block-level proof is strictly stronger
+/// than the edge-level one (it can answer "null" where the edge query answers
+/// "unknown"), and the plan only allows changes that make the oracle answer
+/// false more often, never true more often. It stays available for the A/B
+/// measurement of the two levels' cost ratio.
+cl::opt<bool> EnableBlockLevelNullCheck(
+    "jeandle-null-edge-block-lvi",
+    cl::desc("Prove nullness per (value, block) with a block-level LVI "
+             "constant query before the per-edge predicate query"),
+    cl::Hidden, cl::init(false));
+
+/// The oracle is asked once per non-back predecessor of every joined block,
+/// so its counters must not cost an atomic each. They accumulate into
+/// thread-local plain counters and are flushed into the process-wide totals
+/// once per top-level query.
+thread_local NullEdgeOracleStats LocalStats;
+
+/// Elapsed nanoseconds between two steady_clock reads.
+uint64_t elapsedNanoseconds(std::chrono::steady_clock::time_point Start) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - Start)
+          .count());
+}
+
+} // namespace
+
+bool llvm::isNullEdgeOracleDisabled() { return DisableNullEdgeOracle; }
+
+NullEdgeOracleStats llvm::getLocalNullEdgeOracleStats() { return LocalStats; }
+
+void llvm::flushLocalNullEdgeOracleStats() {
+  if (LocalStats.Calls == 0 && LocalStats.Nanoseconds == 0)
+    return;
+  jeandle::addNullEdgeOracleStats(LocalStats);
+  LocalStats = NullEdgeOracleStats();
+}
 
 /// LazyValueInfo-backed null-edge oracle. This fork's getPredicateOnEdge
 /// returns a Constant*: the constant result of the comparison, or nullptr when
@@ -22,6 +83,10 @@ using namespace llvm;
 /// queried value even when it is produced by freezing poison.
 bool LVINullEdgeOracle::operator()(Value *V, BasicBlock *FromBB,
                                    BasicBlock *ToBB) const {
+  ++LocalStats.Calls;
+  if (DisableNullEdgeOracle)
+    return false;
+
   while (true) {
     V = V->stripPointerCastsAndAliases();
     if (auto *FI = dyn_cast<FreezeInst>(V)) {
@@ -61,11 +126,40 @@ bool LVINullEdgeOracle::operator()(Value *V, BasicBlock *FromBB,
             BasicBlock *NullBB = Cmp->getPredicate() == ICmpInst::ICMP_EQ
                                      ? BI->getSuccessor(0)
                                      : BI->getSuccessor(1);
-            return NullBB == ToBB;
+            ++LocalStats.Structural;
+            bool IsNullEdge = NullBB == ToBB;
+            if (IsNullEdge)
+              ++LocalStats.True;
+            return IsNullEdge;
           }
         }
 
+  // S4 level 2: block-level proof. A null constant for V at the end of FromBB
+  // proves V null on every edge out of FromBB (V is an SSA value, its
+  // null-ness cannot change inside the block). The block value is cached by
+  // LVI, so the repeated queries for the other successors of the same block
+  // are cache hits.
+  if (EnableBlockLevelNullCheck) {
+    auto BlockStart = std::chrono::steady_clock::now();
+    Constant *BlockC = LVI.getConstant(V, FromBB->getTerminator());
+    LocalStats.BlockNanoseconds += elapsedNanoseconds(BlockStart);
+    ++LocalStats.BlockCalls;
+    if (BlockC && isa<ConstantPointerNull>(BlockC)) {
+      ++LocalStats.BlockTrue;
+      ++LocalStats.True;
+      return true;
+    }
+  }
+
+  // Only the LVI-backed part of the oracle is timed: the structural fast path
+  // above is a handful of instructions, and two clock reads would cost more
+  // than the work they measure.
+  auto Start = std::chrono::steady_clock::now();
   Constant *C = LVI.getPredicateOnEdge(
       ICmpInst::ICMP_EQ, V, ConstantPointerNull::get(PT), FromBB, ToBB);
-  return C && C->isOneValue();
+  LocalStats.Nanoseconds += elapsedNanoseconds(Start);
+  bool IsNullEdge = C && C->isOneValue();
+  if (IsNullEdge)
+    ++LocalStats.True;
+  return IsNullEdge;
 }

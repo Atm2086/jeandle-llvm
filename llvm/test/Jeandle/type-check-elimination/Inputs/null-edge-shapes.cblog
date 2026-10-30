@@ -1,0 +1,8 @@
+# Klass 22 with no interfaces, not final. The null-edge shapes below must all
+# recognize the null arm and skip it, so the remaining arm's passing check
+# folds the probe to true.
+IsObjectKlass 22 = false
+IsInterface 22 = false
+GetSecondarySupers 22 = []
+IsEffectivelyFinal 22 = false
+IsSubtype 22 22 = true

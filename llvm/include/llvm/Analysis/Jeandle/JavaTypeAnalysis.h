@@ -10,6 +10,7 @@
 #define LLVM_ANALYSIS_JEANDLE_JAVATYPEANALYSIS_H
 
 #include "llvm/Analysis/Jeandle/CachedJavaType.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/IR/PassManager.h"
 
 #include <cstddef>
@@ -121,6 +122,24 @@ public:
   using Result = JavaTypeAnalysisResult;
   LLVM_ABI Result run(Function &F, FunctionAnalysisManager &FAM);
 };
+
+/// True when the pass-local cache ablation is enabled. In that mode every
+/// real consumer pass starts with an empty Java type cache, so only reuse
+/// inside one pass invocation remains.
+bool javaTypePassLocalEnabled();
+
+/// Clears the Java type caches of an already existing analysis at the entry of
+/// a consumer pass. It never creates an analysis, never changes the IR and
+/// never touches the DT/LVI lifetime; it only removes the cached entries. It
+/// is a no-op unless the pass-local ablation is enabled.
+void clearJavaTypeCacheIfPassLocal(Function &F, FunctionAnalysisManager &FAM,
+                                   StringRef Consumer = "");
+
+/// Number of pass-local cache clears performed so far in this process.
+uint64_t javaTypePassLocalClearCount();
+
+/// Number of consumer pass invocations observed for the given consumer name.
+uint64_t javaTypeConsumerInvocationCount(StringRef Consumer);
 
 } // namespace jeandle
 } // namespace llvm

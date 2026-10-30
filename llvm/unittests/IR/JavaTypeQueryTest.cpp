@@ -1485,4 +1485,92 @@ TEST_F(JavaTypeQueryTest, StatisticsAreOptIn) {
     EXPECT_NE(Text.find(Zero.str()), std::string::npos) << Text;
 }
 
+TEST_F(JavaTypeQueryTest, NullEdgeOracleBudgetLimitsTheOracle) {
+  // A null check in front of the query point, shaped as a diamond: the null
+  // test dominates the query point but neither of its successors does, so the
+  // nullness of the oop stays undecidable there and the null-edge oracle is
+  // on the query path. Three incoming edges reach the query point, so one
+  // query asks the oracle three times.
+  Function *F = parse(R"(
+    define void @test(ptr %obj, i1 %c) {
+    entry:
+      %isnull = icmp eq ptr %obj, null
+      br i1 %isnull, label %null, label %nonnull
+    null:
+      br label %join
+    nonnull:
+      br label %join
+    join:
+      br i1 %c, label %use1, label %use2
+    use1:
+      br label %mid
+    mid:
+      br label %use3
+    use2:
+      br label %use3
+    use3:
+      ret void
+    }
+  )");
+  ASSERT_NE(F, nullptr);
+  DominatorTree DT(*F);
+  Value *V = F->getArg(0);
+  Instruction *Context = block(*F, "use3")->getTerminator();
+
+  int Calls = 0;
+  auto Oracle = [&](Value *, BasicBlock *, BasicBlock *) {
+    ++Calls;
+    return false; // The oracle cannot prove null on any edge.
+  };
+
+  // Without a budget the oracle is consulted on every candidate edge.
+  JavaTypeCache UntruncatedCache;
+  CachedJavaTypeQueryInfo UntruncatedInfo;
+  JavaType Untruncated =
+      getCachedJavaType(V, &DT, Context, Oracle, UntruncatedCache,
+                        UntruncatedInfo);
+  EXPECT_EQ(Calls, 3);
+  EXPECT_FALSE(UntruncatedInfo.SkipVerification);
+
+  // A budget of one grants the first call and refuses the other two. The
+  // refused edges are kept, so no type constraint is lost; the query is
+  // truncated, so it must not claim equality with a cold query.
+  {
+    ScopedQueryOption<unsigned> Budget("jeandle-max-null-edge-oracle-calls", 1);
+    JavaTypeCache Cache;
+    CachedJavaTypeQueryInfo Info;
+    Calls = 0;
+    JavaType Truncated = getCachedJavaType(V, &DT, Context, Oracle, Cache, Info);
+    EXPECT_EQ(Calls, 1);
+    EXPECT_TRUE(Info.SkipVerification);
+    // The oracle answered false on every edge, so refusing a call cannot
+    // change the answer: the truncated result is still the same.
+    EXPECT_EQ(Truncated, Untruncated);
+    // A truncated result must not be published as the final answer.
+    EXPECT_EQ(Cache.finalTypesSize(), 0U);
+  }
+
+  // A budget of zero never asks the oracle: that is the "the oracle always
+  // answers false" switch of the E0 experiment.
+  {
+    ScopedQueryOption<unsigned> Budget("jeandle-max-null-edge-oracle-calls", 0);
+    JavaTypeCache Cache;
+    CachedJavaTypeQueryInfo Info;
+    Calls = 0;
+    JavaType Disabled = getCachedJavaType(V, &DT, Context, Oracle, Cache, Info);
+    EXPECT_EQ(Calls, 0);
+    EXPECT_TRUE(Info.SkipVerification);
+    EXPECT_EQ(Disabled, Untruncated);
+  }
+
+  // The reference engine spends the same budget and keeps the same answer.
+  {
+    ScopedQueryOption<unsigned> Budget("jeandle-max-null-edge-oracle-calls", 0);
+    Calls = 0;
+    JavaType Reference = jeandle::getJavaType(V, &DT, Context, Oracle);
+    EXPECT_EQ(Calls, 0);
+    EXPECT_EQ(Reference, Untruncated);
+  }
+}
+
 } // namespace

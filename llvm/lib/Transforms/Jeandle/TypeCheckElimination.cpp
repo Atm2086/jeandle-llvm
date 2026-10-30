@@ -52,6 +52,9 @@ namespace {
 
 PreservedAnalyses TypeCheckElimination::run(Function &F,
                                             FunctionAnalysisManager &FAM) {
+  // Pass-local ablation: start every consumer invocation with an empty Java
+  // type cache, so only reuse inside this pass remains.
+  jeandle::clearJavaTypeCacheIfPassLocal(F, FAM, "type-check-elimination");
   Module *M = F.getParent();
   if (!M->getNamedMetadata(jeandle::Metadata::JavaMethodCompilation))
     return PreservedAnalyses::all();

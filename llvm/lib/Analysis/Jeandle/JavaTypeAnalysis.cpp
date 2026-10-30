@@ -9,6 +9,7 @@
 #include "llvm/Analysis/Jeandle/JavaTypeAnalysis.h"
 #include "llvm/Analysis/Jeandle/JavaTypeAnalysisStats.h"
 #include "llvm/Analysis/Jeandle/LVINullEdgeOracle.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/IR/Dominators.h"
@@ -47,6 +48,12 @@ cl::opt<bool> ForceFullJavaTypeInvalidation(
 cl::opt<bool> ForceBaseScanJavaTypeInvalidation(
     "jeandle-java-type-force-base-scan-invalidation",
     cl::desc("Scan all base cache entries instead of deleting affected keys"),
+    cl::Hidden, cl::init(false));
+
+cl::opt<bool> JavaTypePassLocal(
+    "jeandle-java-type-pass-local",
+    cl::desc("Clear the Java type caches at the entry of every real consumer "
+             "pass, keeping only pass-internal reuse"),
     cl::Hidden, cl::init(false));
 
 using QueryClock = std::chrono::steady_clock;
@@ -106,6 +113,42 @@ void printJavaType(raw_ostream &OS, const JavaType &Type) {
 
 AnalysisKey JavaTypeAnalysis::Key;
 
+/// Number of pass-local cache clears performed in this process.
+static uint64_t PassLocalClearCount = 0;
+
+/// Number of consumer pass invocations, per consumer name.
+static StringMap<uint64_t> ConsumerInvocations;
+
+bool jeandle::javaTypePassLocalEnabled() { return JavaTypePassLocal; }
+
+uint64_t jeandle::javaTypePassLocalClearCount() { return PassLocalClearCount; }
+
+uint64_t jeandle::javaTypeConsumerInvocationCount(StringRef Consumer) {
+  auto It = ConsumerInvocations.find(Consumer);
+  return It == ConsumerInvocations.end() ? 0 : It->second;
+}
+
+/// Clears the caches of an already existing analysis. The analysis itself is
+/// left in place, so the consumer still gets the same DT/LVI references; only
+/// the memoized type facts are dropped.
+void jeandle::clearJavaTypeCacheIfPassLocal(Function &F,
+                                             FunctionAnalysisManager &FAM,
+                                             StringRef Consumer) {
+  // The invocation counter is diagnostic only, so it is kept out of the
+  // production path (plan: trace/stats are off for the measured runs).
+  if (javaTypeStatsEnabled())
+    ++ConsumerInvocations[Consumer];
+  if (!JavaTypePassLocal)
+    return;
+  // getCachedResult never creates an analysis, so a pass that runs before the
+  // first Java type query does not pay for an analysis it does not need.
+  JavaTypeAnalysisResult *Result = FAM.getCachedResult<JavaTypeAnalysis>(F);
+  if (!Result)
+    return;
+  Result->clear();
+  ++PassLocalClearCount;
+}
+
 /// Public query entry: selects the cache mode and, when statistics are enabled,
 /// reports one optional observation event.
 /// With verification enabled it also runs a query that shares no cache and
@@ -144,15 +187,27 @@ JavaType JavaTypeAnalysisResult::getJavaType(Value *V, Instruction *Context) {
   if (VerifyJavaTypeCache && !DisableJavaTypeCache) {
     Verified = true;
     // The reference result always comes from the untouched original engine.
+    // The null-edge oracle budget truncates a query by refusing further
+    // oracle calls, and the two engines spend that budget on different
+    // traversals (the cached engine reuses path facts). A truncated query
+    // therefore answers a different question than an untruncated one, so the
+    // exhaustion counter is sampled around both evaluations: if either side
+    // was truncated, strict equality is not required.
+    uint64_t BudgetBefore = getNullEdgeOracleBudgetExhaustionCount();
     JavaType Fresh = jeandle::getJavaType(V, &DT, Context, IsNullEdge);
+    uint64_t BudgetAfterReference = getNullEdgeOracleBudgetExhaustionCount();
     // The original API does not expose truncation/cycle diagnostics. A separate
     // cold evaluation supplies only those flags, never the reference result.
     JavaTypeCache DiagnosticCache;
     CachedJavaTypeQueryInfo FreshInfo;
     getCachedJavaType(V, &DT, Context, IsNullEdge, DiagnosticCache, FreshInfo);
+    uint64_t BudgetAfterFresh = getNullEdgeOracleBudgetExhaustionCount();
     // 缓存节省预算；PHI 环中完整缓存与局部贡献也可能精度不同。
     // 跳过严格相等不代表验证通过，单独记录，后续需补语义包含关系校验。
     if (Info.SkipVerification || FreshInfo.SkipVerification)
+      VerificationSkipped = true;
+    else if (BudgetBefore != BudgetAfterReference ||
+             BudgetAfterReference != BudgetAfterFresh)
       VerificationSkipped = true;
     else if (Result != Fresh)
       reportVerificationFailure(F, V, ContextBB, Result, Fresh);
@@ -235,10 +290,22 @@ bool JavaTypeAnalysisResult::invalidate( Function &F,
                                          FunctionAnalysisManager::Invalidator &Inv)
 {
   auto PAC = PA.getChecker<JavaTypeAnalysis>();
-  return !(PAC.preserved() ||
-           PAC.preservedSet<AllAnalysesOn<Function>>()) ||
-         Inv.invalidate<DominatorTreeAnalysis>(F, PA) ||
-         Inv.invalidate<LazyValueAnalysis>(F, PA);
+  bool SelfPreserved =
+      PAC.preserved() || PAC.preservedSet<AllAnalysesOn<Function>>();
+  bool DTInvalidated = Inv.invalidate<DominatorTreeAnalysis>(F, PA);
+  bool LVIInvalidated = Inv.invalidate<LazyValueAnalysis>(F, PA);
+  bool Dropped = !SelfPreserved || DTInvalidated || LVIInvalidated;
+  // 诊断：记录分析被丢弃的原因和当时缓存中残留的条目数，用于定位生命周期断点。
+  if (javaTypeStatsEnabled())
+    errs() << "JavaTypeAnalysisInvalidated function: " << F.getName()
+           << " dropped=" << (Dropped ? 1 : 0)
+           << " self_preserved=" << (SelfPreserved ? 1 : 0)
+           << " dt_invalidated=" << (DTInvalidated ? 1 : 0)
+           << " lvi_invalidated=" << (LVIInvalidated ? 1 : 0)
+           << " base_entries=" << Cache.baseSize()
+           << " path_facts_entries=" << Cache.pathFactsSize()
+           << " final_entries=" << Cache.finalTypesSize() << '\n';
+  return Dropped;
 }
 
 /// Obtains DT and LVI from the analysis manager and creates the Function-level

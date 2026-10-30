@@ -69,12 +69,27 @@ struct Fixture {
         Function::ExternalLinkage, "jeandle.check_instanceof", *M);
     Check->addParamAttr(1, Attribute::NonNull);
     auto *Entry = BasicBlock::Create(C, "entry", F);
+    auto *NullBB = BasicBlock::Create(C, "null", F);
+    auto *NonNullBB = BasicBlock::Create(C, "nonnull", F);
     auto *GuardBB = BasicBlock::Create(C, "guard", F);
     auto *Fail = BasicBlock::Create(C, "fail", F);
     SmallVector<BasicBlock *, 64> Blocks;
     for (unsigned I = 0; I != Depth + Width; ++I)
       Blocks.push_back(BasicBlock::Create(C, "path" + std::to_string(I), F));
-    BranchInst::Create(GuardBB, Entry);
+    // A null check in front of the type check, shaped as a diamond: the null
+    // test dominates the query points, but neither of its successors does, so
+    // the nullness of the oop is undecidable there.  That keeps the null-edge
+    // oracle on the query path -- a value whose nullness the dominating
+    // structure already decides never reaches the oracle, and the oracle-call
+    // assertions of these tests would become vacuous.
+    IRBuilder<> EB(Entry);
+    auto *IsNull =
+        EB.CreateICmpEQ(Obj, ConstantPointerNull::get(Ptr), "isnull");
+    EB.CreateCondBr(IsNull, NullBB, NonNullBB);
+    IRBuilder<> NB(NullBB);
+    NB.CreateBr(GuardBB);
+    IRBuilder<> NNB(NonNullBB);
+    NNB.CreateBr(GuardBB);
     IRBuilder<> B(GuardBB);
     Guard = B.CreateCall(Check, {klass(22), Obj}, "check");
     B.CreateCondBr(Guard, Blocks.front(), Fail);

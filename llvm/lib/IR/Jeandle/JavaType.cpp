@@ -13,6 +13,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -29,6 +30,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -934,6 +936,33 @@ static cl::opt<unsigned> MaxFactsJoinBlocks(
     "jeandle-max-facts-join-blocks", cl::init(128), cl::Hidden,
     cl::desc("Maximum joined blocks per JavaType query dimension"));
 
+/// Maximum number of null-edge oracle calls per top-level query.
+///
+/// The oracle asks LazyValueInfo whether a value is provably null on an edge;
+/// that query dominates the cost of the path-facts join. This option bounds
+/// it: once the budget is spent the oracle is not asked again and the edge is
+/// kept (the conservative answer). Keeping an edge never removes a type
+/// constraint, so running out of budget costs precision but never soundness.
+///
+/// The default is derived from the measured per-query distribution of the
+/// oracle call count (see the optimization report): with the cheap filters
+/// disabled — the configuration in which the oracle is actually consulted —
+/// the heaviest top-level query in the test corpus asked the oracle 63 times.
+/// The default is twice that, so no measured query is truncated while the
+/// worst case stays bounded.
+/// A limit of 0 disables the oracle altogether, which is exactly the
+/// "the oracle always answers false" experiment used as the E0 baseline.
+///
+/// Core owns this option; the cached engine reads the configured value through
+/// jeandle::getNullEdgeOracleCallBudget() so that both engines spend the same
+/// budget and stay comparable in a differential verification.
+static cl::opt<unsigned> MaxNullEdgeOracleCalls(
+    "jeandle-max-null-edge-oracle-calls", cl::init(128), cl::Hidden,
+    cl::desc("Maximum null-edge oracle calls per JavaType query (0 disables "
+             "the oracle)"));
+
+unsigned jeandle::getNullEdgeOracleCallBudget() { return MaxNullEdgeOracleCalls; }
+
 namespace {
 
 /// Per-query evaluation state. Facts depend only on the CFG, branch
@@ -949,7 +978,8 @@ namespace {
 /// keys could alias freshly allocated values and return stale facts.
 struct JavaTypeQueryContext {
   JavaTypeQueryContext(DominatorTree &DT, IsNullEdgeOracle NullOracle)
-      : DT(DT), NullOracle(NullOracle) {}
+      : DT(DT), NullOracle(NullOracle),
+        OracleBudget(MaxNullEdgeOracleCalls) {}
 
   DominatorTree &DT;
   IsNullEdgeOracle NullOracle;
@@ -975,72 +1005,515 @@ struct JavaTypeQueryContext {
   unsigned FactsBudget = MaxFactsJoinBlocks;
   unsigned PhiBudget = MaxFactsJoinBlocks;
   unsigned ConditionDepth = 0;
+  /// Negative pre-filter for the null-edge oracle, one instance per query.
+  /// Mutable so that the (const) edge queries can memoize its per-value
+  /// block sets.
+  mutable NullEdgePreFilter NullEdgeFilter;
+  /// Per-query budget for null-edge oracle calls, one instance per query.
+  /// Mutable so that the (const) edge queries can spend it.
+  mutable NullEdgeOracleBudget OracleBudget;
 };
 
 } // namespace
 
-/// Check if IncomingBB is reached only when Obj is null.
-/// Walks up the dominator tree from IncomingBB looking for a conditional branch
-/// on `icmp eq/ne Obj, null` where IncomingBB is dominated by the "Obj is null"
-/// successor. Using the dominator tree handles all CFG shapes (diamonds, etc.),
-/// not just single-predecessor chains. Only branches are recognized: switch
-/// case values must be constant integers, so a switch can never test a
-/// pointer against null.
-static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
-                            DominatorTree &DT) {
-  Obj = Obj->stripPointerCastsAndAliases();
-  for (auto *Node = DT.getNode(IncomingBB); Node; Node = Node->getIDom()) {
-    BasicBlock *BB = Node->getBlock();
+// =============================================================================
+// Null-edge pre-filter
+// =============================================================================
 
-    if (auto *BI = dyn_cast<BranchInst>(BB->getTerminator())) {
-      if (!BI->isConditional())
-        continue;
-      auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
-      if (!Cmp)
-        continue;
-      ICmpInst::Predicate Pred = Cmp->getPredicate();
-      if (Pred != ICmpInst::ICMP_EQ && Pred != ICmpInst::ICMP_NE)
-        continue;
-      Value *Op0 = Cmp->getOperand(0);
-      Value *Op1 = Cmp->getOperand(1);
-      Value *Tested = isa<ConstantPointerNull>(Op0)   ? Op1
-                      : isa<ConstantPointerNull>(Op1) ? Op0
-                                                      : nullptr;
-      if (!Tested || Tested->stripPointerCastsAndAliases() != Obj)
-        continue;
-      // icmp eq Obj, null -> true successor is the null path;
-      // icmp ne Obj, null -> false successor is the null path.
-      BasicBlock *NullBB =
-          Pred == ICmpInst::ICMP_EQ ? BI->getSuccessor(0) : BI->getSuccessor(1);
-      BasicBlock *OtherBB =
-          Pred == ICmpInst::ICMP_EQ ? BI->getSuccessor(1) : BI->getSuccessor(0);
-      if (NullBB == OtherBB)
-        continue;
-      // IncomingBB must be dominated by the null-path edge.
-      if (DT.dominates(BasicBlockEdge(BB, NullBB), IncomingBB))
-        return true;
+namespace {
+
+/// The filter is asked once per non-back predecessor of every joined block, so
+/// its counters must not cost an atomic each. They accumulate into
+/// thread-local plain counters and are flushed into the process-wide totals
+/// once per top-level query.
+thread_local NullEdgePreFilterStats LocalFilterStats;
+
+/// Process-wide pre-filter totals.
+std::atomic<uint64_t> GlobalFilterHits{0};
+std::atomic<uint64_t> GlobalFilterUses{0};
+
+} // namespace
+
+void jeandle::flushNullEdgePreFilterStats() {
+  if (LocalFilterStats.Hits == 0 && LocalFilterStats.Uses == 0)
+    return;
+  GlobalFilterHits.fetch_add(LocalFilterStats.Hits, std::memory_order_relaxed);
+  GlobalFilterUses.fetch_add(LocalFilterStats.Uses, std::memory_order_relaxed);
+  LocalFilterStats = NullEdgePreFilterStats();
+}
+
+NullEdgePreFilterStats jeandle::getNullEdgePreFilterStats() {
+  NullEdgePreFilterStats Stats;
+  Stats.Hits = GlobalFilterHits.load(std::memory_order_relaxed);
+  Stats.Uses = GlobalFilterUses.load(std::memory_order_relaxed);
+  return Stats;
+}
+
+// =============================================================================
+// Null-edge oracle budget
+// =============================================================================
+
+namespace {
+
+/// Counters of the null-edge oracle budget.
+///
+/// They are accumulated once per top-level query, never inside the oracle's
+/// hot path, so a process-wide atomic per query is cheap enough. The counter
+/// of the heaviest query is a maximum rather than a sum, and is kept apart so
+/// that it can be published with a max update.
+ALWAYS_ENABLED_STATISTIC(NumNullEdgeOracleBudgetExhaustedQueries,
+                          "Java type queries that hit the null-edge oracle "
+                          "budget");
+ALWAYS_ENABLED_STATISTIC(NumNullEdgeOracleBudgetSkippedCalls,
+                          "Java type null-edge oracle calls skipped by the "
+                          "budget");
+ALWAYS_ENABLED_STATISTIC(NumNullEdgeOracleBudgetMaxCallsPerQuery,
+                          "Java type null-edge oracle calls in the heaviest "
+                          "query");
+
+/// Number of top-level queries on this thread that hit the budget. It is
+/// monotonic so that the differential verification can compare it before and
+/// after a fresh evaluation and detect that the two evaluations were truncated
+/// at different points.
+thread_local uint64_t LocalBudgetExhaustionCount = 0;
+
+} // namespace
+
+bool NullEdgeOracleBudget::consume() {
+  if (Remaining == 0) {
+    Spent = true;
+    ++Skipped;
+    return false;
+  }
+  --Remaining;
+  ++Granted;
+  return true;
+}
+
+void jeandle::noteNullEdgeOracleBudgetQuery(uint64_t Granted, uint64_t Skipped,
+                                            bool Exhausted) {
+  if (Exhausted) {
+    NumNullEdgeOracleBudgetExhaustedQueries += 1;
+    ++LocalBudgetExhaustionCount;
+  }
+  NumNullEdgeOracleBudgetSkippedCalls += Skipped;
+  NumNullEdgeOracleBudgetMaxCallsPerQuery.updateMax(Granted);
+}
+
+NullEdgeOracleBudgetStats jeandle::getNullEdgeOracleBudgetStats() {
+  NullEdgeOracleBudgetStats Stats;
+  Stats.ExhaustedQueries = NumNullEdgeOracleBudgetExhaustedQueries.getValue();
+  Stats.SkippedCalls = NumNullEdgeOracleBudgetSkippedCalls.getValue();
+  Stats.MaxCallsPerQuery = NumNullEdgeOracleBudgetMaxCallsPerQuery.getValue();
+  return Stats;
+}
+
+uint64_t jeandle::getNullEdgeOracleBudgetExhaustionCount() {
+  return LocalBudgetExhaustionCount;
+}
+
+/// Maximum recursion depth of the definition-side fold analysis.  Deeper
+/// chains are answered "may fold to null", which only costs an oracle call.
+static const unsigned MaxNullFoldDepth = 16;
+
+/// The value the oracle reasons about: pointer casts and aliases stripped, and
+/// a freeze stripped only when its operand is proven defined (a freeze of
+/// poison may itself be poison, so the oracle keeps it).
+Value *NullEdgePreFilter::canonicalize(Value *V) {
+  auto It = CanonicalValues.find(V);
+  if (It != CanonicalValues.end())
+    return It->second;
+
+  Value *Orig = V;
+  while (true) {
+    V = V->stripPointerCastsAndAliases();
+    if (auto *FI = dyn_cast<FreezeInst>(V)) {
+      if (!jeandle::isProvenDefined(FI->getOperand(0)))
+        break;
+      V = FI->getOperand(0);
+      continue;
     }
+    break;
+  }
+  CanonicalValues.insert(std::make_pair(Orig, V));
+  return V;
+}
+
+/// Blocks in which V is compared against null.
+///
+/// Only null-relevant uses are collected: a comparison of V (or of a pointer
+/// cast of V) against the null constant.  Other uses — a call argument, a
+/// store, a phi incoming — do not constrain V's nullness by themselves.
+/// A pointer cast forwards the nullness of its operand, so the cast's own
+/// users are followed (the oracle strips such casts before comparing).
+static void collectNullTestBlocks(Value *V,
+                                  SmallPtrSetImpl<BasicBlock *> &Out) {
+  SmallVector<Value *, 8> Worklist;
+  SmallPtrSet<Value *, 8> Visited;
+  Worklist.push_back(V);
+  while (!Worklist.empty()) {
+    Value *Cur = Worklist.pop_back_val();
+    if (!Visited.insert(Cur).second)
+      continue;
+    for (User *U : Cur->users()) {
+      LocalFilterStats.Uses++;
+      // A global alias denotes the same object as its aliasee, and the oracle
+      // strips aliases before comparing: the alias' own users are therefore
+      // users of the value as well.
+      if (auto *GA = dyn_cast<GlobalAlias>(U)) {
+        Worklist.push_back(GA);
+        continue;
+      }
+      // A constant expression cast forwards the nullness of its operand and
+      // is stripped by the oracle as well.  Only the forms the oracle strips
+      // are followed, so that the collected set stays a superset of the
+      // blocks whose terminator can prove nullness.
+      if (auto *CE = dyn_cast<ConstantExpr>(U)) {
+        unsigned Op = CE->getOpcode();
+        if (Op == Instruction::BitCast || Op == Instruction::AddrSpaceCast)
+          Worklist.push_back(CE);
+        else if (Op == Instruction::GetElementPtr &&
+                 cast<GEPOperator>(CE)->hasAllZeroIndices())
+          Worklist.push_back(CE);
+        continue;
+      }
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I)
+        continue;
+      if (auto *Cmp = dyn_cast<ICmpInst>(I)) {
+        if (Cmp->getPredicate() != ICmpInst::ICMP_EQ &&
+            Cmp->getPredicate() != ICmpInst::ICMP_NE)
+          continue;
+        Value *Op0 = Cmp->getOperand(0);
+        Value *Op1 = Cmp->getOperand(1);
+        if (isa<ConstantPointerNull>(Op0->stripPointerCastsAndAliases()) ||
+            isa<ConstantPointerNull>(Op1->stripPointerCastsAndAliases()))
+          Out.insert(I->getParent());
+        continue;
+      }
+      // A pointer cast forwards the nullness of its operand.
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+        if (GEP->hasAllZeroIndices() && GEP->getType()->isPointerTy())
+          Worklist.push_back(I);
+        continue;
+      }
+      if (isa<BitCastInst>(I) || isa<AddrSpaceCastInst>(I)) {
+        if (I->getType()->isPointerTy())
+          Worklist.push_back(I);
+        continue;
+      }
+      if (auto *CB = dyn_cast<CallBase>(I)) {
+        if (CB->getReturnedArgOperand() == Cur)
+          Worklist.push_back(I);
+        continue;
+      }
+    }
+  }
+}
+
+/// Blocks in which V is compared against null.
+///
+/// The set is built once per value and reused for every block of a dominator
+/// chain, so a chain walk costs one set lookup per block instead of one
+/// hash-map lookup per block.
+const SmallPtrSet<BasicBlock *, 8> &
+NullEdgePreFilter::getNullTestBlocks(Value *V) {
+  auto It = NullTestBlocks.find(V);
+  if (It != NullTestBlocks.end())
+    return It->second;
+  SmallPtrSet<BasicBlock *, 8> Blocks;
+  collectNullTestBlocks(V, Blocks);
+  return NullTestBlocks.insert(std::make_pair(V, std::move(Blocks)))
+      .first->second;
+}
+
+/// Is V compared against null in block B?
+bool NullEdgePreFilter::isNullTestedInBlock(Value *V, BasicBlock *B) {
+  return getNullTestBlocks(V).contains(B);
+}
+
+/// Does a block dominating B (up to V's definition block) test V against null?
+///
+/// A null test in a dominating block only constrains the edges dominated by
+/// the tested side; the filter does not check which side that is, so it may
+/// keep an edge the oracle would have skipped.  That only costs precision.
+bool NullEdgePreFilter::hasDominatingNullTest(Value *V, BasicBlock *B) {
+  // The definition block of V cuts the walk: above it the value does not
+  // exist yet, so no condition there can constrain it.
+  BasicBlock *DefBB =
+      dyn_cast<Instruction>(V) ? cast<Instruction>(V)->getParent() : nullptr;
+
+  // One lookup for the whole chain: the set of null-test blocks is per value.
+  const SmallPtrSet<BasicBlock *, 8> &Tested = getNullTestBlocks(V);
+  for (DomTreeNode *Node = DT->getNode(B); Node; Node = Node->getIDom()) {
+    BasicBlock *Cur = Node->getBlock();
+    if (Tested.contains(Cur))
+      return true;
+    if (Cur == DefBB)
+      break;
   }
   return false;
 }
 
-/// Positive proof that V is null on edge From -> To, answered by the query's
-/// null-edge oracle (the LazyValueInfo-backed implementation recognizes null
-/// tests directly on the edge's branch as well as threaded/indirect forms),
-/// with a structural fallback for threaded shapes the oracle misses: null
-/// tests on casted pointers and with the null constant on either operand
-/// side. When in doubt the answer is false — keeping an edge is always sound.
+/// Can the incoming value X be null on the edge out of PhiBB?
+///
+/// The lattice computes the incoming arm on its edge: the arm is null when
+/// the arm itself folds to null, when the block's own terminator tests it
+/// against null, or when a dominating block does.
+bool NullEdgePreFilter::mayBeNullOnEdge(Value *X, BasicBlock *PhiBB,
+                                        unsigned Depth) {
+  X = canonicalize(X);
+  if (mayFoldToNull(X, Depth + 1))
+    return true;
+  if (isNullTestedInBlock(X, PhiBB))
+    return true;
+  if (hasDominatingNullTest(X, PhiBB))
+    return true;
+  return false;
+}
+
+/// Can the lattice fold V to the constant null?
+///
+/// Mirrors LazyValueInfo's folding rules for pointer values: a select folds to
+/// null when both of its arms fold to null, a phi folds to null when all of
+/// its incoming arms are null on their edge.  Every other pointer definition
+/// (call, load, argument, GEP, freeze, ...) is overdefined or provably
+/// non-null and can never become a null constant.
+bool NullEdgePreFilter::mayFoldToNull(Value *V, unsigned Depth) {
+  if (Depth > MaxNullFoldDepth)
+    return true; // Conservative: assume the chain may still fold to null.
+  V = canonicalize(V);
+  auto It = MayFoldNull.find(V);
+  if (It != MayFoldNull.end())
+    return It->second;
+
+  bool Result = false;
+  if (auto *C = dyn_cast<Constant>(V)) {
+    Result = C->isNullValue();
+  } else if (auto *SI = dyn_cast<SelectInst>(V)) {
+    Result = mayFoldToNull(SI->getTrueValue(), Depth + 1) &&
+             mayFoldToNull(SI->getFalseValue(), Depth + 1);
+  } else if (auto *PN = dyn_cast<PHINode>(V)) {
+    Result = true;
+    for (unsigned I = 0, E = PN->getNumIncomingValues();
+         I != E && Result; ++I)
+      Result = mayBeNullOnEdge(PN->getIncomingValue(I),
+                                PN->getIncomingBlock(I), Depth + 1);
+  }
+
+  MayFoldNull.insert(std::make_pair(V, Result));
+  return Result;
+}
+
+/// Shared core of the structural nullness scan and of the negative
+/// pre-filter.
+///
+/// Walks up the dominator tree from \p From looking for a conditional branch
+/// on `icmp eq/ne Obj, null` whose null side (resp. non-null side) dominates
+/// \p From.  Using the dominator tree handles all CFG shapes (diamonds, etc.),
+/// not just single-predecessor chains.  Only branches are recognized: switch
+/// case values must be constant integers, so a switch can never test a
+/// pointer against null.
+///
+/// The walk stops at the block that defines \p Obj: above its definition the
+/// value does not exist yet, so no null test can mention it.
+///
+/// \p Tested is the set of blocks that can contain a null test of the value
+/// (built from its use list).  A block outside that set does not mention the
+/// value at all, so its terminator cannot constrain it: the terminator is
+/// then not even looked at.  This is what makes the merged walk cheap — the
+/// test set of a value holds only the few blocks that mention it, while a
+/// dominator chain can be long.  \p Tested may be null, in which case every
+/// block of the chain is analysed.
+///
+/// \p HasNullTest, when not null, reports whether the chain contains a null
+/// test of the value.  That is the question the negative pre-filter asks:
+/// without such a test no lattice query can prove the value null.
+static Nullness scanNullChain(Value *Obj, BasicBlock *From, DominatorTree &DT,
+                               const SmallPtrSetImpl<BasicBlock *> *Tested,
+                               bool *HasNullTest) {
+  if (!Obj || !From)
+    return Nullness::Unknown;
+
+  BasicBlock *DefBB = nullptr;
+  if (auto *I = dyn_cast<Instruction>(Obj))
+    DefBB = I->getParent();
+
+  Nullness Result = Nullness::Unknown;
+  for (auto *Node = DT.getNode(From); Node; Node = Node->getIDom()) {
+    BasicBlock *BB = Node->getBlock();
+
+    // A block that does not mention the value cannot constrain it.
+    bool MentionsValue = !Tested || Tested->contains(BB);
+    if (MentionsValue && HasNullTest)
+      *HasNullTest = true;
+
+    if (MentionsValue) {
+      if (auto *BI = dyn_cast<BranchInst>(BB->getTerminator())) {
+        if (BI->isConditional()) {
+          if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
+            ICmpInst::Predicate Pred = Cmp->getPredicate();
+            if (Pred == ICmpInst::ICMP_EQ || Pred == ICmpInst::ICMP_NE) {
+              Value *Op0 = Cmp->getOperand(0);
+              Value *Op1 = Cmp->getOperand(1);
+              Value *TestedValue = isa<ConstantPointerNull>(Op0)   ? Op1
+                                   : isa<ConstantPointerNull>(Op1) ? Op0
+                                                                  : nullptr;
+              if (TestedValue &&
+                  TestedValue->stripPointerCastsAndAliases() == Obj) {
+                // icmp eq Obj, null -> true successor is the null path;
+                // icmp ne Obj, null -> false successor is the null path.
+                BasicBlock *NullBB = Pred == ICmpInst::ICMP_EQ
+                                         ? BI->getSuccessor(0)
+                                         : BI->getSuccessor(1);
+                BasicBlock *OtherBB = Pred == ICmpInst::ICMP_EQ
+                                          ? BI->getSuccessor(1)
+                                          : BI->getSuccessor(0);
+                // Two successors are the same block: the branch does not
+                // discriminate between the two outcomes, so it proves nothing.
+                if (NullBB != OtherBB) {
+                  bool NullDom =
+                      DT.dominates(BasicBlockEdge(BB, NullBB), From);
+                  bool NonNullDom =
+                      DT.dominates(BasicBlockEdge(BB, OtherBB), From);
+                  if (NullDom && NonNullDom)
+                    return Nullness::Unknown; // Contradictory tests.
+                  if (NullDom) {
+                    if (Result == Nullness::NonNull)
+                      return Nullness::Unknown; // Contradictory tests.
+                    Result = Nullness::Null;
+                  } else if (NonNullDom) {
+                    if (Result == Nullness::Null)
+                      return Nullness::Unknown; // Contradictory tests.
+                    Result = Nullness::NonNull;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (BB == DefBB)
+      break; // Above the definition the value does not exist yet.
+  }
+  return Result;
+}
+
+/// Block-level state of V at the top of From.
+///
+/// The structural conclusion and the negative filter's question are answered
+/// by one walk of the dominator chain: the chain of the value and the chain
+/// of its definition are the same chain, and a chain walk is the expensive
+/// part of the null-edge path.
+NullEdgePreFilter::BlockState
+NullEdgePreFilter::blockState(Value *V, BasicBlock *From, DominatorTree &DT) {
+  this->DT = &DT;
+  BlockState State;
+  if (!V || !From)
+    return State;
+
+  Value *Canon = canonicalize(V);
+  Value *Obj = V->stripPointerCastsAndAliases();
+
+  if (Canon == Obj) {
+    // The filter and the structural scan reason about the same value, so the
+    // set of blocks that can mention it restricts both: one walk answers both
+    // questions.
+    const SmallPtrSet<BasicBlock *, 8> &Tested = getNullTestBlocks(Canon);
+    State.Structural =
+        scanNullChain(Obj, From, DT, &Tested, &State.HasNullTest);
+  } else {
+    // A freeze whose operand is proven defined: the filter reasons about the
+    // operand, the structural scan about the freeze itself.  The two do not
+    // share a set of blocks, so the chain is walked twice.  This is rare.
+    State.Structural = scanNullChain(Obj, From, DT, nullptr, nullptr);
+    State.HasNullTest = hasDominatingNullTest(Canon, From);
+  }
+  return State;
+}
+
+bool NullEdgePreFilter::mayProveNull(Value *V, const BlockState &State,
+                                     DominatorTree &DT) {
+  this->DT = &DT;
+  Value *Canon = canonicalize(V);
+
+  // Only values with an enumerable use list and a definition point can be
+  // filtered. Constants and globals are rare here and are always asked.
+  if (!isa<Instruction>(Canon) && !isa<Argument>(Canon))
+    return true;
+
+  // The lattice may fold the value itself to the constant null.
+  if (mayFoldToNull(Canon, 0))
+    return true;
+
+  // A dominating condition (or the edge's own terminator) may test the value
+  // against null.
+  if (State.HasNullTest)
+    return true;
+
+  ++LocalFilterStats.Hits;
+  return false;
+}
+
+/// Structural nullness of V at the top of From, derived from dominance only.
+///
+/// See scanNullChain for the details of the scan.
+Nullness jeandle::nullnessAtBlockEnd(Value *V, BasicBlock *From,
+                                     DominatorTree &DT) {
+  if (!V || !From)
+    return Nullness::Unknown;
+  return scanNullChain(V->stripPointerCastsAndAliases(), From, DT, nullptr,
+                       nullptr);
+}
+
+/// Positive proof that V is null on edge From -> To.
+///
+/// The structural scan answers first: it proves nullness at the top of From
+/// (hence on every edge out of From, V being an SSA value) and proves
+/// non-nullness as well, which spares the oracle a query.  Only an unknown
+/// structural answer falls through to the query's null-edge oracle (the
+/// LazyValueInfo-backed implementation recognizes null tests directly on the
+/// edge's branch as well as threaded/indirect forms).
+///
+/// When in doubt the answer is false — keeping an edge is always sound.
 static bool isNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
                        const JavaTypeQueryContext &Q) {
   if (!Q.DT.isReachableFromEntry(From))
     return false; // Lattice reasoning is undefined for unreachable blocks;
                   // keep the edge (the conservative answer).
-  if (Q.NullOracle && Q.NullOracle(V, From, To))
+  // One walk of the dominator chain answers both the structural question and
+  // the negative filter's question: the conclusion is a property of the pair
+  // (V, From) and covers every edge out of From.
+  NullEdgePreFilter::BlockState State =
+      Q.NullEdgeFilter.blockState(V, From, Q.DT);
+  switch (State.Structural) {
+  case Nullness::Null:
+    return true; // Null at the top of From means null on every edge out of
+                 // From: V is an SSA value, so its null-ness cannot change
+                 // inside the block.
+  case Nullness::NonNull:
+    return false; // Proven non-null: the edge carries a live value.
+  case Nullness::Unknown:
+    break;
+  }
+  // Negative pre-filter: a null proof needs a dominating condition that
+  // mentions V. When no block on the dominator chain mentions V, no such
+  // condition exists and the oracle is not asked. The filter only ever
+  // suppresses a query, so it can cost precision but never soundness.
+  if (!Q.NullEdgeFilter.mayProveNull(V, State, Q.DT))
+    return false;
+  if (!Q.NullOracle)
+    return false;
+  // Budget: the oracle call is the expensive part of this function. Once the
+  // per-query budget is spent the oracle is not asked and the edge is kept.
+  // Keeping an edge never removes a type constraint, so running out of
+  // budget costs precision, never soundness.
+  if (!Q.OracleBudget.consume())
+    return false;
+  if (Q.NullOracle(V, From, To))
     return true;
-  // Null at the top of From (a dominating null-check edge) means null on
-  // every edge out of From, including this one: V is an SSA value, so its
-  // null-ness cannot change inside the block.
-  return isNullCheckPath(From, V, Q.DT);
+  return false;
 }
 
 // Condition tracing: trace from a branch condition to a check_instanceof call
@@ -1735,7 +2208,7 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
       // be queried with values that dominate the edge, which is not
       // guaranteed between a traced condition's PHI arms and QueryObj.
       BasicBlock *IncBB = PN->getIncomingBlock(I);
-      if (isNullCheckPath(IncBB, QueryObj, Q.DT))
+      if (jeandle::nullnessAtBlockEnd(QueryObj, IncBB, Q.DT) == Nullness::Null)
         continue;
 
       if (auto *CI = dyn_cast<ConstantInt>(Inc)) {
@@ -2085,6 +2558,11 @@ static JavaType factsAt(Value *V, BasicBlock *BB, JavaTypeQueryContext &Q) {
     JavaType E = factsAt(V, P, Q);
     mergePathFacts(E, edgeGuard(P, BB, V, Q));
     joinArm(Joined, First, std::move(E));
+    // Unknown is absorbing (typeUnion({}, X) == {}): once the accumulator is
+    // unknown the remaining arms cannot change it. The cached engine applies
+    // the same cut, so both engines consume the join budget alike.
+    if (Joined.isUnknown())
+      break;
   }
 
   // The join loop above recursed through factsAt, which may have rehashed
@@ -2232,5 +2710,15 @@ JavaType jeandle::getJavaType(Value *V, DominatorTree *DT, Instruction *Context,
 
   JavaTypeQueryContext Q{*DT, IsNullEdge};
   JavaType T = valueDimension(V, Q);
-  return typeIntersect(T, factsAt(V, Context->getParent(), Q));
+  JavaType Result = typeIntersect(T, factsAt(V, Context->getParent(), Q));
+  // Top-level query boundary: publish this thread's null-edge pre-filter
+  // counters into the process-wide totals.
+  flushNullEdgePreFilterStats();
+  // Top-level query boundary: report how the null-edge oracle budget was
+  // spent. A query that exhausted the budget is truncated, so its answer is
+  // sound but less precise than an untruncated one.
+  noteNullEdgeOracleBudgetQuery(Q.OracleBudget.grantedCalls(),
+                                Q.OracleBudget.skippedCalls(),
+                                Q.OracleBudget.exhausted());
+  return Result;
 }

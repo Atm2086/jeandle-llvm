@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/Jeandle/CachedJavaType.h"
+#include "llvm/Analysis/Jeandle/LVINullEdgeOracle.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -619,51 +620,6 @@ static Value *stripCastsAndFreeze(Value *V) {
   }
 }
 
-/// Check if IncomingBB is reached only when Obj is null.
-/// Walks up the dominator tree from IncomingBB looking for a conditional branch
-/// on `icmp eq/ne Obj, null` where IncomingBB is dominated by the "Obj is null"
-/// successor. Using the dominator tree handles all CFG shapes (diamonds, etc.),
-/// not just single-predecessor chains. Only branches are recognized: switch
-/// case values must be constant integers, so a switch can never test a
-/// pointer against null.
-static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
-                            DominatorTree &DT) {
-  Obj = Obj->stripPointerCastsAndAliases();
-  for (auto *Node = DT.getNode(IncomingBB); Node; Node = Node->getIDom()) {
-    BasicBlock *BB = Node->getBlock();
-
-    if (auto *BI = dyn_cast<BranchInst>(BB->getTerminator())) {
-      if (!BI->isConditional())
-        continue;
-      auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
-      if (!Cmp)
-        continue;
-      ICmpInst::Predicate Pred = Cmp->getPredicate();
-      if (Pred != ICmpInst::ICMP_EQ && Pred != ICmpInst::ICMP_NE)
-        continue;
-      Value *Op0 = Cmp->getOperand(0);
-      Value *Op1 = Cmp->getOperand(1);
-      Value *Tested = isa<ConstantPointerNull>(Op0)   ? Op1
-                      : isa<ConstantPointerNull>(Op1) ? Op0
-                                                      : nullptr;
-      if (!Tested || Tested->stripPointerCastsAndAliases() != Obj)
-        continue;
-      // icmp eq Obj, null -> true successor is the null path;
-      // icmp ne Obj, null -> false successor is the null path.
-      BasicBlock *NullBB =
-          Pred == ICmpInst::ICMP_EQ ? BI->getSuccessor(0) : BI->getSuccessor(1);
-      BasicBlock *OtherBB =
-          Pred == ICmpInst::ICMP_EQ ? BI->getSuccessor(1) : BI->getSuccessor(0);
-      if (NullBB == OtherBB)
-        continue;
-      // IncomingBB must be dominated by the null-path edge.
-      if (DT.dominates(BasicBlockEdge(BB, NullBB), IncomingBB))
-        return true;
-    }
-  }
-  return false;
-}
-
 /// Recursively trace a branch condition back to a jeandle.check_instanceof
 /// call on QueryObj. Returns a matched TraceResult if successful, or an
 /// unmatched TraceResult ({Klass=0}) if the condition cannot be linked to a
@@ -989,7 +945,8 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
       // there), the arm is only live for the null execution, where type
       // facts conditioned on non-null are meaningless — skip it regardless
       // of whether the incoming is a constant.
-      if (isNullCheckPath(PN->getIncomingBlock(I), QueryObj, DT))
+      if (jeandle::nullnessAtBlockEnd(QueryObj, PN->getIncomingBlock(I), DT) ==
+          Nullness::Null)
         continue;
 
       if (auto *CI = dyn_cast<ConstantInt>(Inc)) {
@@ -1159,6 +1116,17 @@ struct CachedJavaTypeQueryContext {
   uint64_t FinalHits = 0;
   uint64_t FinalMisses = 0;
 
+  /// Negative pre-filter for the null-edge oracle, one instance per query.
+  /// Mutable so that the (const) edge queries can memoize its per-value
+  /// block sets.
+  mutable NullEdgePreFilter NullEdgeFilter;
+
+  /// Per-query budget for null-edge oracle calls, one instance per query.
+  /// Mutable so that the (const) edge queries can spend it. The limit comes
+  /// from the reference engine's option, so both engines spend the same
+  /// budget and truncate at comparable points.
+  mutable NullEdgeOracleBudget OracleBudget;
+
   CachedJavaTypeQueryContext(
       DominatorTree &DT, IsNullEdgeOracle NullOracle, BaseMemo &BaseTypes,
       DenseMap<std::pair<Value *, BasicBlock *>, JavaType> *PathFacts = nullptr,
@@ -1172,7 +1140,8 @@ CachedJavaTypeQueryContext::CachedJavaTypeQueryContext(
     const DenseMap<std::pair<Value *, BasicBlock *>, JavaType> *FinalTypes)
     : DT(DT), NullOracle(NullOracle), BaseTypes(BaseTypes),
       PathFacts(PathFacts), FinalTypes(FinalTypes),
-      FactsBudget(getFactsJoinBudget()), PhiBudget(getFactsJoinBudget()) {}
+      FactsBudget(getFactsJoinBudget()), PhiBudget(getFactsJoinBudget()),
+      OracleBudget(jeandle::getNullEdgeOracleCallBudget()) {}
 
 } // namespace
 
@@ -1269,16 +1238,53 @@ static JavaType edgeGuard(BasicBlock *From, BasicBlock *To, Value *V,
                           TR.FalseExclusions);
 }
 
-/// Positive proof that V is null on edge From -> To, answered by the query's
-/// null-edge oracle (the LazyValueInfo-backed implementation recognizes null
-/// tests directly on the edge's branch as well as threaded/indirect forms).
-/// When in doubt the oracle answers false — keeping an edge is always sound.
+/// Positive proof that V is null on edge From -> To.
+///
+/// The structural scan answers first: it proves nullness at the top of From
+/// (hence on every edge out of From, V being an SSA value) and proves
+/// non-nullness as well, which spares the oracle a query.  Only an unknown
+/// structural answer falls through to the query's null-edge oracle (the
+/// LazyValueInfo-backed implementation recognizes null tests directly on the
+/// edge's branch as well as threaded/indirect forms).
+///
+/// When in doubt the answer is false — keeping an edge is always sound.
 static bool isNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
                        const CachedJavaTypeQueryContext &Q) {
   if (!Q.DT.isReachableFromEntry(From))
     return false; // Lattice reasoning is undefined for unreachable blocks;
                   // keep the edge (the conservative answer).
-  return Q.NullOracle && Q.NullOracle(V, From, To);
+  // One walk of the dominator chain answers both the structural question and
+  // the negative filter's question. The structural scan is the same one the
+  // reference engine uses, so both engines agree on which edges carry a null
+  // value. The conclusion is a property of the pair (V, From) and covers every
+  // edge out of From.
+  NullEdgePreFilter::BlockState State =
+      Q.NullEdgeFilter.blockState(V, From, Q.DT);
+  switch (State.Structural) {
+  case Nullness::Null:
+    return true; // Null at the top of From means null on every edge out of
+                 // From: V is an SSA value, so its null-ness cannot change
+                 // inside the block.
+  case Nullness::NonNull:
+    return false; // Proven non-null: the edge carries a live value.
+  case Nullness::Unknown:
+    break;
+  }
+  // Negative pre-filter: a null proof needs a dominating condition that
+  // mentions V. When no block on the dominator chain mentions V, no such
+  // condition exists and the oracle is not asked. The filter only ever
+  // suppresses a query, so it can cost precision but never soundness.
+  if (!Q.NullEdgeFilter.mayProveNull(V, State, Q.DT))
+    return false;
+  if (!Q.NullOracle)
+    return false;
+  // Budget: the oracle call is the expensive part of this function. Once the
+  // per-query budget is spent the oracle is not asked and the edge is kept.
+  // Keeping an edge never removes a type constraint, so running out of
+  // budget costs precision, never soundness.
+  if (!Q.OracleBudget.consume())
+    return false;
+  return Q.NullOracle(V, From, To);
 }
 
 /// Facts holding about V at the top of BB: the join over non-skipped incoming
@@ -1339,6 +1345,13 @@ static JavaType factsAt(Value *V, BasicBlock *BB,
     JavaType E = factsAt(V, P, Q);
     mergePathFacts(E, edgeGuard(P, BB, V, Q.DT));
     joinArm(Joined, First, std::move(E));
+    // Unknown is absorbing (typeUnion({}, X) == {}): once the accumulator is
+    // unknown the remaining arms cannot change it. Stopping here skips their
+    // oracle queries and their recursion. The join result is unchanged; only
+    // the budget left for later blocks changes, so the reference engine
+    // applies the same cut to keep both engines in step.
+    if (Joined.isUnknown())
+      break;
   }
 
   // The join loop above recursed through factsAt, which may have rehashed
@@ -1483,12 +1496,29 @@ JavaType jeandle::getCachedJavaType(Value *V, DominatorTree *DT,
 
   // Only a completed top-level result may be published. Recursive PHI frames
   // can depend on the outer PHI stack and must not publish their local results.
-  if (!Q.FactsTruncated && !Q.PhiTruncated)
+  // A query that exhausted the null-edge oracle budget is truncated as well:
+  // its answer is sound but less precise, so it must not be published as the
+  // final answer of this context.
+  if (!Q.FactsTruncated && !Q.PhiTruncated && !Q.OracleBudget.exhausted())
     Cache.FinalTypes.try_emplace(Key, Result);
-  Info.SkipVerification = Q.FactsTruncated || Q.PhiTruncated || Q.PhiCycleHit;
+  // Budget exhaustion counts as a truncation: the query then answered a
+  // different question than an untruncated one, so a strict comparison with a
+  // cold query is not required (and would not hold in general).
+  Info.SkipVerification = Q.FactsTruncated || Q.PhiTruncated || Q.PhiCycleHit ||
+                          Q.OracleBudget.exhausted();
   Info.FactsHits = Q.FactsHits;
   Info.FactsMisses = Q.FactsMisses;
   Info.FinalHits += Q.FinalHits;
   Info.FinalMisses += Q.FinalMisses;
+  // Top-level query boundary: publish this thread's null-edge oracle counters
+  // into the process-wide totals. The oracle itself only touches thread-local
+  // counters, so its hot path never pays for an atomic.
+  flushLocalNullEdgeOracleStats();
+  flushNullEdgePreFilterStats();
+  // Top-level query boundary: report how the null-edge oracle budget was
+  // spent, in the same process-wide counters the reference engine uses.
+  noteNullEdgeOracleBudgetQuery(Q.OracleBudget.grantedCalls(),
+                                Q.OracleBudget.skippedCalls(),
+                                Q.OracleBudget.exhausted());
   return Result;
 }

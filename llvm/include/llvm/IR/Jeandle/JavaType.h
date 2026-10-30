@@ -18,8 +18,11 @@
 #ifndef JEANDLE_JAVA_TYPE_H
 #define JEANDLE_JAVA_TYPE_H
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/Support/Compiler.h"
 
 #include <cstdint>
 
@@ -83,6 +86,210 @@ struct JavaType {
 /// where the engine is not run at all.
 using IsNullEdgeOracle =
     function_ref<bool(Value *V, BasicBlock *FromBB, BasicBlock *ToBB)>;
+
+/// Nullness of a value at the top of a block.
+enum class Nullness {
+  /// No conclusion: nothing proves the value null or non-null there.
+  Unknown,
+  /// Proven non-null there.
+  NonNull,
+  /// Proven null there.
+  Null,
+};
+
+/// Structural nullness of V at the top of From, derived from dominance only.
+///
+/// The scan walks the dominator chain of From up to (and including) the block
+/// that defines V, looking for a conditional branch on `icmp eq/ne V, null`:
+/// when the null side of that branch dominates From, V is null at From; when
+/// the non-null side dominates From, V is not null there.  A branch whose two
+/// successors are the same block proves nothing (the edge is a duplicate), and
+/// two tests that contradict each other prove nothing either.
+///
+/// The conclusion is a proof and therefore holds on every edge out of From: V
+/// is an SSA value, so its null-ness cannot change inside the block.  Sharing
+/// one implementation between the cached and the reference engine keeps the
+/// two engines on the same null-edge semantics.
+LLVM_ABI Nullness nullnessAtBlockEnd(Value *V, BasicBlock *From,
+                                     DominatorTree &DT);
+
+/// Negative pre-filter for the null-edge oracle.
+///
+/// The oracle answers "is V provably null on the edge From->To?".  It can only
+/// answer "yes" in two situations:
+///
+///  (1) The lattice folds V itself to the constant null.  LazyValueInfo folds
+///      a pointer to null only through a `select` whose arms are both null, a
+///      `phi` all of whose incoming arms are null on their edge, or a null
+///      constant; every other pointer definition is overdefined (or provably
+///      non-null) and can never become a null constant.
+///
+///  (2) A condition that dominates the edge tests V against null: an
+///      `icmp eq/ne V, null` on the edge's own terminator, on a dominating
+///      block's terminator, or an assume/guard constraining V.
+///
+/// The filter answers "no proof is possible" when neither can hold.  It is a
+/// refutation, not a proof: it never skips an edge the oracle would have
+/// skipped, so it can cost precision but never soundness.  Keeping an edge is
+/// always sound (JavaType is conditioned on a non-null oop); skipping an edge
+/// that is not proven null is not.
+///
+/// One instance per top-level query: the per-value data (canonical value,
+/// null-test blocks, fold conclusion) is memoized, so a value is analysed once
+/// per query no matter how many edges are examined.
+class NullEdgePreFilter {
+public:
+  /// Block-level state of a value at the top of a block.
+  ///
+  /// Both answers come out of a single walk of the dominator chain, so the
+  /// chain is traversed once per (value, block) pair instead of once per
+  /// question.
+  struct BlockState {
+    /// Three-valued conclusion derived from dominance only: Null when the
+    /// null side of a dominating null test reaches the block, NonNull when
+    /// the non-null side does, Unknown otherwise.
+    Nullness Structural = Nullness::Unknown;
+    /// Whether the dominator chain contains a block in which the value is
+    /// compared against null. This is the question the negative filter asks:
+    /// without such a test no lattice query can prove the value null.
+    bool HasNullTest = false;
+  };
+
+  /// Computes the block-level state of V at the top of From.
+  ///
+  /// The walk stops at the block that defines V: above its definition the
+  /// value does not exist yet, so no test can mention it.
+  BlockState blockState(Value *V, BasicBlock *From, DominatorTree &DT);
+
+  /// Returns true when a null proof for V on an edge out of From is possible.
+  /// When it returns false the caller must not ask the oracle.
+  /// \p State must be the block state of the same (V, From) pair.
+  bool mayProveNull(Value *V, const BlockState &State, DominatorTree &DT);
+
+private:
+  /// The value the oracle reasons about: pointer casts and aliases stripped,
+  /// and a freeze stripped only when its operand is proven defined.  Mirrors
+  /// the normalization done by LVINullEdgeOracle.
+  Value *canonicalize(Value *V);
+
+  /// Blocks in which V is compared against null, memoized per value.
+  const SmallPtrSet<BasicBlock *, 8> &getNullTestBlocks(Value *V);
+
+  /// Can the lattice fold V to the constant null?  Conservative: an answer of
+  /// false means V provably cannot become a null constant.
+  bool mayFoldToNull(Value *V, unsigned Depth);
+
+  /// Can the incoming value X be null on the edge out of PhiBB?
+  bool mayBeNullOnEdge(Value *X, BasicBlock *PhiBB, unsigned Depth);
+
+  /// Is V compared against null in block B (directly, through pointer casts or
+  /// under a not/and/or condition)?
+  bool isNullTestedInBlock(Value *V, BasicBlock *B);
+
+  /// Does a block dominating B (up to V's definition block) test V against
+  /// null?
+  bool hasDominatingNullTest(Value *V, BasicBlock *B);
+
+  /// Blocks in which V is compared against null, memoized per value.
+  DenseMap<Value *, SmallPtrSet<BasicBlock *, 8>> NullTestBlocks;
+  /// Whether the lattice may fold the value to the constant null, memoized.
+  DenseMap<Value *, bool> MayFoldNull;
+  /// The canonical value the oracle reasons about, memoized per value.
+  DenseMap<Value *, Value *> CanonicalValues;
+  /// The dominator tree of the running query (the filter is per-query).
+  DominatorTree *DT = nullptr;
+};
+
+/// Counters of the null-edge pre-filter.
+///   Hits - queries answered "no proof possible" (the oracle was not asked)
+///   Uses - V users scanned while building the mentioning-block sets
+struct NullEdgePreFilterStats {
+  uint64_t Hits = 0;
+  uint64_t Uses = 0;
+};
+
+/// Per-query budget for null-edge oracle calls.
+///
+/// The oracle asks LazyValueInfo whether a value is provably null on an edge.
+/// That query is the dominant cost of the path-facts join, so one top-level
+/// query may only ask it a bounded number of times. Exceeding the budget is
+/// always sound: the oracle is not asked and the answer is "not proven null",
+/// i.e. the edge is kept — keeping an edge never removes a type constraint.
+///
+/// The budget is deliberately *not* a precision knob: it trades precision for
+/// a compile-time bound, and it is reported so that the differential
+/// verification does not require two evaluations to agree when they were
+/// truncated at different points.
+class NullEdgeOracleBudget {
+public:
+  explicit NullEdgeOracleBudget(unsigned Limit) : Remaining(Limit) {}
+
+  /// Reserves one oracle call. Returns false when the budget is spent, in
+  /// which case the caller must not ask the oracle.
+  LLVM_ABI bool consume();
+
+  /// Whether the budget was spent during this query.
+  bool exhausted() const { return Spent; }
+
+  /// Number of oracle calls this budget refused.
+  uint64_t skippedCalls() const { return Skipped; }
+
+  /// Number of oracle calls this budget granted.
+  uint64_t grantedCalls() const { return Granted; }
+
+private:
+  unsigned Remaining;
+  bool Spent = false;
+  uint64_t Skipped = 0;
+  uint64_t Granted = 0;
+};
+
+/// Counters of the null-edge oracle budget.
+///   ExhaustedQueries - top-level queries that hit the budget
+///   SkippedCalls - oracle calls that were not made because the budget was
+///                  already spent
+///   MaxCallsPerQuery - the largest number of oracle calls one query made;
+///                  this is the distribution the default budget is derived from
+struct NullEdgeOracleBudgetStats {
+  uint64_t ExhaustedQueries = 0;
+  uint64_t SkippedCalls = 0;
+  uint64_t MaxCallsPerQuery = 0;
+};
+
+/// Returns the process-wide null-edge oracle budget counters.
+LLVM_ABI NullEdgeOracleBudgetStats getNullEdgeOracleBudgetStats();
+
+/// Records the outcome of one top-level query: `Granted` oracle calls were
+/// made, `Skipped` calls were refused because the budget was already spent,
+/// and the budget was exhausted when `Exhausted` is set.
+///
+/// The per-thread exhaustion counter is monotonic on purpose: the
+/// differential verification compares it before and after a fresh evaluation
+/// to detect that the two evaluations were truncated at different points, in
+/// which case their results need not be equal.
+LLVM_ABI void noteNullEdgeOracleBudgetQuery(uint64_t Granted, uint64_t Skipped,
+                                            bool Exhausted);
+
+/// Returns the number of top-level queries on this thread that hit the
+/// null-edge oracle budget.
+LLVM_ABI uint64_t getNullEdgeOracleBudgetExhaustionCount();
+
+/// Returns the configured per-query null-edge oracle call budget.
+///
+/// The option is owned by the reference engine (the IR layer); the cached
+/// engine reads it through this accessor so that both engines spend the same
+/// budget. That equality is what makes a differential comparison meaningful:
+/// the two engines must truncate at comparable points, otherwise they answer
+/// different questions.
+LLVM_ABI unsigned getNullEdgeOracleCallBudget();
+
+/// Flushes this thread's null-edge pre-filter counters into the process-wide
+/// totals and resets them. Called once per top-level Java type query, so the
+/// filter's hot path never touches a shared atomic.
+LLVM_ABI void flushNullEdgePreFilterStats();
+
+/// Returns the process-wide null-edge pre-filter counters.
+LLVM_ABI NullEdgePreFilterStats getNullEdgePreFilterStats();
 
 /// Get the Java type of a value.
 ///

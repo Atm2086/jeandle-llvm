@@ -7,8 +7,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/Jeandle/JavaTypeAnalysisStats.h"
+#include "llvm/Analysis/Jeandle/JavaTypeAnalysis.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Jeandle/JavaType.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Format.h"
@@ -75,6 +77,27 @@ ALWAYS_ENABLED_STATISTIC(TotalVerifications,
 ALWAYS_ENABLED_STATISTIC(TotalVerificationSkips,
                         "Java type truncated or PHI-cycle comparisons skipped");
 
+// Null-edge oracle counters. The oracle is asked "is V provably null on this
+// edge?" for every non-back predecessor of every joined block, so its call
+// volume and answer distribution decide which null-edge optimization pays
+// off. They are always enabled: the oracle accumulates into thread-local
+// counters and flushes the delta here once per top-level query, so the hot
+// path never touches an atomic.
+ALWAYS_ENABLED_STATISTIC(NullOracleCalls,
+                        "Java type null-edge oracle calls");
+ALWAYS_ENABLED_STATISTIC(NullOracleStructural,
+                        "Java type null-edge oracle calls resolved structurally");
+ALWAYS_ENABLED_STATISTIC(NullOracleTrue,
+                        "Java type null-edge oracle calls answered true");
+ALWAYS_ENABLED_STATISTIC(NullOracleNanoseconds,
+                        "Java type null-edge oracle LVI time (ns)");
+ALWAYS_ENABLED_STATISTIC(NullOracleBlockCalls,
+                        "Java type null-edge oracle block-level LVI queries");
+ALWAYS_ENABLED_STATISTIC(NullOracleBlockTrue,
+                        "Java type null-edge oracle block-level LVI answers true");
+ALWAYS_ENABLED_STATISTIC(NullOracleBlockNanoseconds,
+                        "Java type null-edge oracle block-level LVI time (ns)");
+
 /// Prints a cache hit rate; prints n/a when there is no sample yet so that we
 /// never divide by zero.
 void printRate(raw_ostream &OS, uint64_t Hits, uint64_t Misses) {
@@ -90,6 +113,28 @@ void printRate(raw_ostream &OS, uint64_t Hits, uint64_t Misses) {
 AnalysisKey JavaTypeStatsAnalysis::Key;
 
 bool jeandle::javaTypeStatsEnabled() { return CollectJavaTypeStats; }
+
+void jeandle::addNullEdgeOracleStats(const NullEdgeOracleStats &Delta) {
+  NullOracleCalls += Delta.Calls;
+  NullOracleStructural += Delta.Structural;
+  NullOracleTrue += Delta.True;
+  NullOracleNanoseconds += Delta.Nanoseconds;
+  NullOracleBlockCalls += Delta.BlockCalls;
+  NullOracleBlockTrue += Delta.BlockTrue;
+  NullOracleBlockNanoseconds += Delta.BlockNanoseconds;
+}
+
+NullEdgeOracleStats jeandle::getNullEdgeOracleStats() {
+  NullEdgeOracleStats Stats;
+  Stats.Calls = NullOracleCalls.getValue();
+  Stats.Structural = NullOracleStructural.getValue();
+  Stats.True = NullOracleTrue.getValue();
+  Stats.Nanoseconds = NullOracleNanoseconds.getValue();
+  Stats.BlockCalls = NullOracleBlockCalls.getValue();
+  Stats.BlockTrue = NullOracleBlockTrue.getValue();
+  Stats.BlockNanoseconds = NullOracleBlockNanoseconds.getValue();
+  return Stats;
+}
 
 /// The only place counters are accumulated, including the process-wide `-stats`
 /// numbers, so the default query path never touches an atomic.
@@ -308,6 +353,16 @@ JavaTypeAnalysisSummaryPrinterPass::run(Module &M, ModuleAnalysisManager &) {
   OS << "  base-only query misses: " << TotalBaseMisses.getValue() << '\n';
   OS << "  base insertions: " << TotalBaseInsertions.getValue() << '\n';
   OS << "  clears: " << TotalClears.getValue() << '\n';
+  OS << "  pass-local cache clears: " << javaTypePassLocalClearCount() << '\n';
+  OS << "  consumer invocations: "
+     << "type-check-elimination="
+     << javaTypeConsumerInvocationCount("type-check-elimination")
+     << " recover-type-info="
+     << javaTypeConsumerInvocationCount("recover-type-info")
+     << " constant-field-folding="
+     << javaTypeConsumerInvocationCount("constant-field-folding")
+     << " cha-devirtualization="
+     << javaTypeConsumerInvocationCount("cha-devirtualization") << '\n';
   OS << "  invalidation requests: " << TotalInvalidations.getValue() << '\n';
   OS << "  selective invalidations: " << TotalSelectiveInvalidations.getValue() << '\n';
   OS << "  CFG invalidations: " << TotalCFGInvalidations.getValue() << '\n';
@@ -330,5 +385,27 @@ JavaTypeAnalysisSummaryPrinterPass::run(Module &M, ModuleAnalysisManager &) {
   OS << "  bypasses: " << TotalBypasses.getValue() << '\n';
   OS << "  verifications: " << TotalVerifications.getValue() << '\n';
   OS << "  verification skips: " << TotalVerificationSkips.getValue() << '\n';
+  OS << "  null-edge oracle calls: " << NullOracleCalls.getValue() << '\n';
+  OS << "  null-edge oracle structural hits: "
+     << NullOracleStructural.getValue() << '\n';
+  OS << "  null-edge oracle true answers: " << NullOracleTrue.getValue() << '\n';
+  OS << "  null-edge oracle lvi time (ns): "
+     << NullOracleNanoseconds.getValue() << '\n';
+  OS << "  null-edge oracle block-level lvi queries: "
+     << NullOracleBlockCalls.getValue() << '\n';
+  OS << "  null-edge oracle block-level lvi true answers: "
+     << NullOracleBlockTrue.getValue() << '\n';
+  OS << "  null-edge oracle block-level lvi time (ns): "
+     << NullOracleBlockNanoseconds.getValue() << '\n';
+  NullEdgePreFilterStats FilterStats = getNullEdgePreFilterStats();
+  OS << "  null-edge prefilter hits: " << FilterStats.Hits << '\n';
+  OS << "  null-edge prefilter uses scanned: " << FilterStats.Uses << '\n';
+  NullEdgeOracleBudgetStats BudgetStats = getNullEdgeOracleBudgetStats();
+  OS << "  null-edge oracle budget exhausted queries: "
+     << BudgetStats.ExhaustedQueries << '\n';
+  OS << "  null-edge oracle budget skipped calls: " << BudgetStats.SkippedCalls
+     << '\n';
+  OS << "  null-edge oracle budget max calls per query: "
+     << BudgetStats.MaxCallsPerQuery << '\n';
   return PreservedAnalyses::all();
 }

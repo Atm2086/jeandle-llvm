@@ -729,6 +729,10 @@ bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
 
 PreservedAnalyses ConstantFieldFolding::run(Function &F,
                                             FunctionAnalysisManager &FAM) {
+  // Pass-local ablation: start every consumer invocation with an empty Java
+  // type cache, so only reuse inside this pass remains. RepeatedConstantFolding
+  // calls this pass directly, so every one of its rounds is covered too.
+  jeandle::clearJavaTypeCacheIfPassLocal(F, FAM, "constant-field-folding");
   Module *M = F.getParent();
   if (!M->getNamedMetadata(jeandle::Metadata::JavaMethodCompilation))
     return PreservedAnalyses::all();

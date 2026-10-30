@@ -18,6 +18,7 @@
 #define LLVM_ANALYSIS_JEANDLE_JAVATYPEANALYSISSTATS_H
 
 #include "llvm/Analysis/Jeandle/JavaTypeAnalysis.h"
+#include "llvm/Analysis/Jeandle/LVINullEdgeOracle.h"
 #include "llvm/IR/PassManager.h"
 
 #include <cstddef>
@@ -80,6 +81,18 @@ struct JavaTypeQueryStats {
   size_t PeakFinalEntries = 0;
   size_t PeakBaseEntries = 0;
 };
+
+/// Process-wide counters for the null-edge oracle (jeandle::IsNullEdgeOracle)
+/// are declared with the oracle itself; see NullEdgeOracleStats in
+/// LVINullEdgeOracle.h.
+
+/// Adds freshly observed oracle counters to the process-wide totals. The
+/// oracle accumulates into thread-local counters and flushes the delta here
+/// once per top-level query, so the hot path never touches an atomic.
+LLVM_ABI void addNullEdgeOracleStats(const NullEdgeOracleStats &Delta);
+
+/// Returns the process-wide null-edge oracle totals.
+LLVM_ABI NullEdgeOracleStats getNullEdgeOracleStats();
 
 /// Function-level statistics leaf analysis: it only holds counters and has no
 /// IR dependencies. Its result never invalidates (invalidate() always returns
