@@ -7,6 +7,8 @@
 
 declare ptr @jeandle.load_klass(ptr addrspace(1))
 declare i1 @jeandle.check_instanceof(ptr, ptr addrspace(1) nonnull)
+declare hotspotcc void @jeandle.pre_barrier(ptr addrspace(1))
+declare hotspotcc void @jeandle.post_barrier(ptr addrspace(1), ptr addrspace(1))
 
 define void @x07_pipeline(ptr addrspace(1) nonnull %obj) #0 gc "hotspotgc" {
 entry:
@@ -25,7 +27,11 @@ entry:
 ; CHECK-SAME: final_hits: 1 final_misses: 0 base_insertions: 0
 ; CHECK: JavaTypeQuery function: x07_pipeline ordinal: 5
 ; CHECK-SAME: final_hits: 1 final_misses: 0 base_insertions: 0
-; CHECK-NOT: JavaTypeQuery function: x07_pipeline ordinal: 6
+; CHECK: JavaTypeQuery function: x07_pipeline ordinal: 6
+; CHECK-SAME: final_hits: 1 final_misses: 0 base_insertions: 0
+; CHECK: JavaTypeQuery function: x07_pipeline ordinal: 7
+; CHECK-SAME: final_hits: 1 final_misses: 0 base_insertions: 0
+; CHECK-NOT: JavaTypeQuery function: x07_pipeline ordinal: 8
 
 attributes #0 = { "java-method"="0" }
 !java-method-compilation = !{}

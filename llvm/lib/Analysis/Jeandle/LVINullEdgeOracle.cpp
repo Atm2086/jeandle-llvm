@@ -1,4 +1,5 @@
-//===- LVINullEdgeOracle.cpp - LVI-backed Java null-edge queries ------------===//
+//===- LVINullEdgeOracle.cpp - LVI-backed Java null-edge queries
+//------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -65,6 +66,10 @@ bool LVINullEdgeQuery::hasPotentialTest(Value *V) {
         return HasTests[V] = true;
       continue;
     }
+    // ConstantData and unused values have no materialized use list, so
+    // iterating users() would trip an assertion in assertion-enabled builds.
+    if (Cur->use_empty())
+      continue;
     for (User *U : Cur->users()) {
       if (!spendWork())
         return HasTests[V] = true;
