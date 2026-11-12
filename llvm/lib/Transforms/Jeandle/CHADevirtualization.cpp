@@ -456,8 +456,8 @@ InvokeInst *optimizeInvokeBasic(InvokeInst &CB,
 
 bool optimizeCallSite(InvokeInst &CB, DomTreeUpdater &DTU,
                       jeandle::JavaTypeAnalysisResult &JavaTypes,
-                      LazyValueInfo &LVI,
-                      const jeandle::VMCallbacks &Callbacks, uintptr_t Caller,
+                      LazyValueInfo &LVI, const jeandle::VMCallbacks &Callbacks,
+                      uintptr_t Caller,
                       SmallVectorImpl<InvokeInst *> &Deferred) {
   using jeandle::JavaType;
 

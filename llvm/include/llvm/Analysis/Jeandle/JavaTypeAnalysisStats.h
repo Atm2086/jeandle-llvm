@@ -150,8 +150,7 @@ public:
 /// It clears a JavaTypeAnalysis result only if one already exists, so it does
 /// not create JavaTypeAnalysis, DT, or LVI and does not change IR or analysis
 /// lifetimes. CROSS-PASS pipelines omit this pass.
-class JavaTypeCacheClearPass
-    : public PassInfoMixin<JavaTypeCacheClearPass> {
+class JavaTypeCacheClearPass : public PassInfoMixin<JavaTypeCacheClearPass> {
 public:
   LLVM_ABI PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
   static bool isRequired() { return true; }

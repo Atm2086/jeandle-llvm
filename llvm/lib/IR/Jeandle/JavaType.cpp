@@ -2230,8 +2230,8 @@ static JavaType phiValueType(PHINode *PN, JavaTypeQueryContext &Q) {
 /// edge facts for PHIs and definition-point operand facts for forwarders.
 /// Cycles and exhausted budgets fall back to the complete base bound.
 static JavaType valueDimension(Value *V, JavaTypeQueryContext &Q) {
-  JavaType Base = getBaseJavaType(
-      V, &Q.BaseTypes, &Q.DefinedValues, Q.Cache ? &Q.Cache->Base : nullptr);
+  JavaType Base = getBaseJavaType(V, &Q.BaseTypes, &Q.DefinedValues,
+                                  Q.Cache ? &Q.Cache->Base : nullptr);
   SmallVector<Value *, 4> Inputs;
   if (!getBaseTypeInputs(V, Inputs, /*SkipVacuousArms=*/true) || Base.Exact)
     return Base;
@@ -2348,9 +2348,9 @@ static JavaType edgeGuard(BasicBlock *From, BasicBlock *To, Value *V,
     Q.Cache->Facts.recordGuard(false, false);
     return computeEdgeGuard(From, To, V, Q);
   }
-  return Q.Cache->Facts.getGuard(
-      V, From, To, Q.ConditionDepth,
-      [&] { return computeEdgeGuard(From, To, V, Q); });
+  return Q.Cache->Facts.getGuard(V, From, To, Q.ConditionDepth, [&] {
+    return computeEdgeGuard(From, To, V, Q);
+  });
 }
 
 JavaType jeandle::getJavaType(Value *V, DominatorTree *DT, Instruction *Context,

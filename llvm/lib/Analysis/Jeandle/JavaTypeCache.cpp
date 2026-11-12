@@ -21,9 +21,9 @@ constexpr unsigned MaxDependencyValues = 4096;
 constexpr unsigned MaxDependencyEdges = 4 * MaxDependencyValues;
 
 template <typename MapT, typename LeafPredicate>
-size_t invalidateValues(MapT &Memo, ArrayRef<Value *> Affected,
-                        bool CFGChanged, JavaTypeBaseInvalidationMode Mode,
-                        size_t &SlotsScanned, LeafPredicate IsLeaf) {
+size_t invalidateValues(MapT &Memo, ArrayRef<Value *> Affected, bool CFGChanged,
+                        JavaTypeBaseInvalidationMode Mode, size_t &SlotsScanned,
+                        LeafPredicate IsLeaf) {
   size_t OldSize = Memo.size();
   if (!CFGChanged && Mode == JavaTypeBaseInvalidationMode::SelectiveKeys) {
     for (Value *V : Affected)
@@ -278,8 +278,8 @@ bool JavaTypeFactsCache::getNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
   return Result;
 }
 
-JavaType JavaTypeFactsCache::getGuard(Value *V, BasicBlock *From, BasicBlock *To,
-                                      unsigned ConditionDepth,
+JavaType JavaTypeFactsCache::getGuard(Value *V, BasicBlock *From,
+                                      BasicBlock *To, unsigned ConditionDepth,
                                       function_ref<JavaType()> Compute) {
   assert(Owner == From->getParent() && Owner == To->getParent() &&
          "wrong facts cache owner");
@@ -343,7 +343,8 @@ JavaType *JavaTypeFinalCache::lookup(Value *V, BasicBlock *BB) {
   return It == Memo.end() ? nullptr : &It->second;
 }
 
-bool JavaTypeFinalCache::insert(Value *V, BasicBlock *BB, const JavaType &Type) {
+bool JavaTypeFinalCache::insert(Value *V, BasicBlock *BB,
+                                const JavaType &Type) {
   bool Inserted = Memo.try_emplace(Key{V, BB}, Type).second;
   if (Inserted && StatsEnabled)
     ++Counters.EntriesAdded;
@@ -368,9 +369,7 @@ void JavaTypeFinalCache::clear() {
   Memo.clear();
 }
 
-void JavaTypeFinalCache::notifyOracleChanged() {
-  invalidate();
-}
+void JavaTypeFinalCache::notifyOracleChanged() { invalidate(); }
 
 size_t JavaTypeFinalCache::invalidate() {
   size_t Removed = Memo.size();
@@ -414,8 +413,8 @@ void JavaTypeCache::notifyOracleChanged() {
 
 JavaTypeCacheInvalidationInfo
 JavaTypeCache::invalidate(ArrayRef<Value *> Changed, bool CFGChanged,
-                            JavaTypeBaseInvalidationMode Mode,
-                            JavaTypeContextPreservation Context) {
+                          JavaTypeBaseInvalidationMode Mode,
+                          JavaTypeContextPreservation Context) {
   JavaTypeCacheInvalidationInfo Info;
   size_t OldBase = Base.size();
   size_t OldDefined = Defined.size();
@@ -486,8 +485,8 @@ JavaTypeCache::invalidate(ArrayRef<Value *> Changed, bool CFGChanged,
   }
   Info.BaseRemoved =
       Base.invalidate(Affected, CFGChanged, Mode, Info.BaseSlotsScanned);
-  Info.DefinedRemoved = Defined.invalidate(Affected, CFGChanged, Mode,
-                                           Info.DefinedSlotsScanned);
+  Info.DefinedRemoved =
+      Defined.invalidate(Affected, CFGChanged, Mode, Info.DefinedSlotsScanned);
   if (Context == JavaTypeContextPreservation::Preserved && !CFGChanged &&
       getMode() == JavaTypeFactsCache::Mode::StableOracleEpoch) {
     auto EraseAffected = [&](auto &Map, size_t &Scanned) {
@@ -503,8 +502,10 @@ JavaTypeCache::invalidate(ArrayRef<Value *> Changed, bool CFGChanged,
       return Removed;
     };
     Info.FactsRemoved = EraseAffected(Facts.Paths, Info.PathFactsSlotsScanned);
-    Info.FactsRemoved += EraseAffected(Facts.Guards, Info.PathFactsSlotsScanned);
-    Info.FactsRemoved += EraseAffected(Facts.NullEdges, Info.PathFactsSlotsScanned);
+    Info.FactsRemoved +=
+        EraseAffected(Facts.Guards, Info.PathFactsSlotsScanned);
+    Info.FactsRemoved +=
+        EraseAffected(Facts.NullEdges, Info.PathFactsSlotsScanned);
     Info.FinalRemoved = EraseAffected(Final.Memo, Info.FinalTypesSlotsScanned);
     if (Facts.StatsEnabled) {
       ++Facts.Counters.Invalidations;

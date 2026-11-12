@@ -168,8 +168,7 @@ private:
   bool StatsEnabled = false;
 
 public:
-  explicit JavaTypeFactsCache(Function *F = nullptr,
-                              Mode M = Mode::GuardOnly)
+  explicit JavaTypeFactsCache(Function *F = nullptr, Mode M = Mode::GuardOnly)
       : Owner(F), CacheMode(M) {}
   explicit JavaTypeFactsCache(Function &F, Mode M = Mode::GuardOnly)
       : JavaTypeFactsCache(&F, M) {}
@@ -208,9 +207,10 @@ public:
 };
 
 /// A completed top-level query only, keyed by value and context block. Query
-/// budgets limit solving work, not reuse of a valid result. Recursive facts/value
-/// results never enter this cache. IR and oracle notifications clear the entire
-/// table, so publication needs no dependency tracking or later revalidation.
+/// budgets limit solving work, not reuse of a valid result. Recursive
+/// facts/value results never enter this cache. IR and oracle notifications
+/// clear the entire table, so publication needs no dependency tracking or later
+/// revalidation.
 class LLVM_ABI JavaTypeFinalCache {
 public:
   using Key = std::pair<Value *, BasicBlock *>;
@@ -265,10 +265,10 @@ public:
   JavaTypeFinalCache Final;
 
   explicit JavaTypeCache(Function *F = nullptr, Mode M = Mode::GuardOnly,
-                           bool EnableFinal = true)
+                         bool EnableFinal = true)
       : Owner(F), EnableFinal(EnableFinal), Facts(F, M) {}
   explicit JavaTypeCache(Function &F, Mode M = Mode::GuardOnly,
-                           bool EnableFinal = true)
+                         bool EnableFinal = true)
       : JavaTypeCache(&F, M, EnableFinal) {}
   void bind(Function &F);
   Function *getFunction() const { return Owner; }

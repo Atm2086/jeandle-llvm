@@ -140,7 +140,8 @@ JavaType getJavaType(Value *V, DominatorTree *DT, Instruction *Context,
 
 /// Shared solver interface for the cached query adapter. Borrows Base/Defined/
 /// Facts storage; Final lookup/publication and the cache lifecycle belong to
-/// the caller. Recursive state stays local. Cache must be bound to the function.
+/// the caller. Recursive state stays local. Cache must be bound to the
+/// function.
 JavaType getJavaType(Value *V, DominatorTree *DT, Instruction *Context,
                      IsNullEdgeOracle IsNullEdge, JavaTypeCache &Cache);
 

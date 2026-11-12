@@ -14,9 +14,9 @@ using namespace llvm;
 using namespace llvm::jeandle;
 
 JavaType jeandle::getCachedJavaType(Value *V, DominatorTree *DT,
-                                     Instruction *Context,
-                                     IsNullEdgeOracle IsNullEdge,
-                                     JavaTypeCache &Cache) {
+                                    Instruction *Context,
+                                    IsNullEdgeOracle IsNullEdge,
+                                    JavaTypeCache &Cache) {
   if (Context)
     Cache.bind(*Context->getFunction());
   else if (auto *I = dyn_cast<Instruction>(V))

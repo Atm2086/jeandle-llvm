@@ -7,9 +7,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/Jeandle/JavaTypeAnalysis.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/Jeandle/JavaTypeAnalysisStats.h"
 #include "llvm/Analysis/Jeandle/LVINullEdgeOracle.h"
-#include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -27,21 +27,20 @@ using namespace llvm::jeandle;
 
 namespace {
 
-cl::opt<bool> DisableJavaTypeCache(
-    "jeandle-disable-java-type-cache",
-    cl::desc("Bypass the cross-query Java type caches"),
-    cl::Hidden,
-    cl::init(false));
+cl::opt<bool>
+    DisableJavaTypeCache("jeandle-disable-java-type-cache",
+                         cl::desc("Bypass the cross-query Java type caches"),
+                         cl::Hidden, cl::init(false));
 
 cl::opt<bool> VerifyJavaTypeCache(
     "jeandle-verify-java-type-cache",
     cl::desc("Recompute Java type queries without cross-query caches"),
-    cl::Hidden,
-    cl::init(false));
+    cl::Hidden, cl::init(false));
 
 cl::opt<bool> ForceFullJavaTypeInvalidation(
     "jeandle-java-type-force-full-invalidation",
-    cl::desc("Use full clears for Java type mutation notifications (A/B baseline)"),
+    cl::desc(
+        "Use full clears for Java type mutation notifications (A/B baseline)"),
     cl::Hidden, cl::init(false));
 
 cl::opt<bool> ForceBaseScanJavaTypeInvalidation(
@@ -55,13 +54,14 @@ using QueryClock = std::chrono::steady_clock;
 /// statistics are enabled.
 uint64_t elapsedNanoseconds(QueryClock::time_point Start) {
   return static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(QueryClock::now() - Start).count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(QueryClock::now() -
+                                                           Start)
+          .count());
 }
 
 /// 输出 JavaType 的类、精确性、接口和排除类型，供验证失败时诊断使用。
 void printJavaType(raw_ostream &OS, const JavaType &Type) {
-  OS << "{Klass=" << Type.Klass
-     << ", Exact=" << (Type.Exact ? "true" : "false")
+  OS << "{Klass=" << Type.Klass << ", Exact=" << (Type.Exact ? "true" : "false")
      << ", Interfaces=[";
   bool First = true;
   for (uintptr_t Klass : Type.Interfaces) {
@@ -82,9 +82,10 @@ void printJavaType(raw_ostream &OS, const JavaType &Type) {
 }
 
 /// 报告缓存结果与重新计算结果的不一致，打印函数、查询值及上下文后终止。
-[[noreturn]] void reportVerificationFailure(
-    Function &F, Value *V, BasicBlock *ContextBB, const JavaType &Cached,
-    const JavaType &Fresh) {
+[[noreturn]] void reportVerificationFailure(Function &F, Value *V,
+                                            BasicBlock *ContextBB,
+                                            const JavaType &Cached,
+                                            const JavaType &Fresh) {
   std::string Message;
   raw_string_ostream OS(Message);
   OS << "JavaTypeAnalysis verification failed in function '" << F.getName()
@@ -106,10 +107,11 @@ void printJavaType(raw_ostream &OS, const JavaType &Type) {
 
 AnalysisKey JavaTypeAnalysis::Key;
 
-/// Query through caller-owned caches. Each cache owns its counters; the optional
-/// observer receives only this query's deltas. Verification reruns the shared
-/// solver without external caches and compares complete types. A truncated
-/// cold reference cannot verify a more precise result obtained from warm paths.
+/// Query through caller-owned caches. Each cache owns its counters; the
+/// optional observer receives only this query's deltas. Verification reruns the
+/// shared solver without external caches and compares complete types. A
+/// truncated cold reference cannot verify a more precise result obtained from
+/// warm paths.
 JavaType JavaTypeAnalysisResult::getJavaType(Value *V, Instruction *Context) {
   assert(V && "cannot query the Java type of a null Value");
   assert((!Context || Context->getFunction() == &F) &&
@@ -121,15 +123,14 @@ JavaType JavaTypeAnalysisResult::getJavaType(Value *V, Instruction *Context) {
   const bool Bypassed = DisableJavaTypeCache;
   bool Verified = VerifyJavaTypeCache && !Bypassed;
   auto Query = [&] {
-    JavaType Result = Bypassed
-                          ? jeandle::getJavaType(V, &DT, Context, IsNullEdge)
-                          : getCachedJavaType(V, &DT, Context, IsNullEdge,
-                                                Cache);
+    JavaType Result =
+        Bypassed ? jeandle::getJavaType(V, &DT, Context, IsNullEdge)
+                 : getCachedJavaType(V, &DT, Context, IsNullEdge, Cache);
     if (Verified) {
       LVINullEdgeOracle ReferenceOracle{LVI};
       bool FactsTruncated = false;
-      JavaType Fresh =
-          jeandle::getJavaType(V, &DT, Context, ReferenceOracle, &FactsTruncated);
+      JavaType Fresh = jeandle::getJavaType(V, &DT, Context, ReferenceOracle,
+                                            &FactsTruncated);
       if (Result != Fresh) {
         if (!FactsTruncated)
           reportVerificationFailure(F, V, ContextBB, Result, Fresh);
@@ -186,9 +187,7 @@ JavaType JavaTypeAnalysisResult::getJavaType(Value *V, Instruction *Context) {
 
 /// Clear all four caches and LVI without resetting cumulative statistics.
 /// Notify before mutation; callers still maintain DT before the next query.
-void JavaTypeAnalysisResult::clear() {
-  invalidateImpl({}, false, true);
-}
+void JavaTypeAnalysisResult::clear() { invalidateImpl({}, false, true); }
 
 /// Invalidate the old use closure before RAUW/deletion, including non-key
 /// conditions. LVI is cleared here; callers maintain DT before the next query.
@@ -213,9 +212,9 @@ void JavaTypeAnalysisResult::invalidateForCFGChange(Value &Changed) {
   invalidate({V}, true);
 }
 
-void JavaTypeAnalysisResult::invalidateImpl(ArrayRef<Value *> Changed,
-                                            bool CFGChanged, bool ForceFull,
-                                            JavaTypeContextPreservation Context) {
+void JavaTypeAnalysisResult::invalidateImpl(
+    ArrayRef<Value *> Changed, bool CFGChanged, bool ForceFull,
+    JavaTypeContextPreservation Context) {
   auto Start = Observer ? QueryClock::now() : QueryClock::time_point{};
   JavaTypeCacheInvalidationInfo Info;
   if (ForceFull) {
@@ -226,15 +225,15 @@ void JavaTypeAnalysisResult::invalidateImpl(ArrayRef<Value *> Changed,
     Info.FullClear = true;
     Cache.clear();
   } else {
-    Info = Cache.invalidate(
-        Changed, CFGChanged,
-        ForceBaseScanJavaTypeInvalidation
-            ? JavaTypeBaseInvalidationMode::Scan
-            : JavaTypeBaseInvalidationMode::SelectiveKeys, Context);
+    Info = Cache.invalidate(Changed, CFGChanged,
+                            ForceBaseScanJavaTypeInvalidation
+                                ? JavaTypeBaseInvalidationMode::Scan
+                                : JavaTypeBaseInvalidationMode::SelectiveKeys,
+                            Context);
   }
   // Even an unrelated instruction edit can change LVI's bounded reasoning.
-  // By default drop its old results before mutation; Facts and Final have also been
-  // cleared, so no result depending on the old oracle state is retained.
+  // By default drop its old results before mutation; Facts and Final have also
+  // been cleared, so no result depending on the old oracle state is retained.
   if (ForceFull || Info.FullClear || CFGChanged ||
       Context != JavaTypeContextPreservation::Preserved)
     LVI.clear();
@@ -253,22 +252,20 @@ void JavaTypeAnalysisResult::invalidateImpl(ArrayRef<Value *> Changed,
 
 /// 供 FunctionAnalysisManager 判断本分析是否失效，返回 true 表示应丢弃结果。
 /// 未显式保留本分析，或其依赖的 DominatorTree/LVI 失效时，整个 Result 失效。
-bool JavaTypeAnalysisResult::invalidate( Function &F,
-                                         const PreservedAnalyses &PA,
-                                         FunctionAnalysisManager::Invalidator &Inv)
-{
+bool JavaTypeAnalysisResult::invalidate(
+    Function &F, const PreservedAnalyses &PA,
+    FunctionAnalysisManager::Invalidator &Inv) {
   auto PAC = PA.getChecker<JavaTypeAnalysis>();
-  return !(PAC.preserved() ||
-           PAC.preservedSet<AllAnalysesOn<Function>>()) ||
+  return !(PAC.preserved() || PAC.preservedSet<AllAnalysesOn<Function>>()) ||
          Inv.invalidate<DominatorTreeAnalysis>(F, PA) ||
          Inv.invalidate<LazyValueAnalysis>(F, PA);
 }
 
 /// Obtains DT and LVI from the analysis manager and creates the Function-level
 /// Result holding references to them. Statistics are off by default; when they
-/// are enabled, the non-invalidating statistics analysis is fetched and injected
-/// as the observer. The function is not traversed here: type computation and
-/// cache population happen lazily on later queries.
+/// are enabled, the non-invalidating statistics analysis is fetched and
+/// injected as the observer. The function is not traversed here: type
+/// computation and cache population happen lazily on later queries.
 JavaTypeAnalysis::Result JavaTypeAnalysis::run(Function &F,
                                                FunctionAnalysisManager &FAM) {
   DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);

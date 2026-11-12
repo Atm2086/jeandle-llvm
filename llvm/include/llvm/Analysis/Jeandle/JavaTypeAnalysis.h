@@ -78,11 +78,11 @@ struct JavaTypeInvalidationEvent {
   bool CFGChanged = false;
 };
 
-/// Observation interface for queries and invalidations, used to keep statistics,
-/// timing and printing out of JavaTypeAnalysis. A Result receives at most one
-/// observer, at construction time, and nullptr by default. The observer must
-/// outlive the Result; JavaTypeStatsAnalysis satisfies that because its result
-/// never invalidates.
+/// Observation interface for queries and invalidations, used to keep
+/// statistics, timing and printing out of JavaTypeAnalysis. A Result receives
+/// at most one observer, at construction time, and nullptr by default. The
+/// observer must outlive the Result; JavaTypeStatsAnalysis satisfies that
+/// because its result never invalidates.
 class JavaTypeQueryObserver {
 public:
   virtual ~JavaTypeQueryObserver() = default;
@@ -91,18 +91,16 @@ public:
 };
 
 /// 单个 Function 的分析结果，供优化 Pass 查询 JavaType 并管理缓存失效。
-/// Owns separate Base, Defined, path Facts and top-level Final caches. Traversal
-/// stacks and budgets remain local to each query. DT/LVI belong to the analysis
-/// manager. Notify before IR mutation; this result clears LVI and callers must
-/// update DT before querying again. External LVI maintenance without an IR
-/// notification also requires clear().
-/// Statistics and timing are not implemented here: queries and invalidations are
-/// reported to an optional Observer, and nothing is collected by default.
+/// Owns separate Base, Defined, path Facts and top-level Final caches.
+/// Traversal stacks and budgets remain local to each query. DT/LVI belong to
+/// the analysis manager. Notify before IR mutation; this result clears LVI and
+/// callers must update DT before querying again. External LVI maintenance
+/// without an IR notification also requires clear(). Statistics and timing are
+/// not implemented here: queries and invalidations are reported to an optional
+/// Observer, and nothing is collected by default.
 class JavaTypeAnalysisResult {
 public:
-
-  LLVM_ABI JavaType getJavaType(Value *V,
-                                Instruction *Context = nullptr);
+  LLVM_ABI JavaType getJavaType(Value *V, Instruction *Context = nullptr);
   LLVM_ABI void clear();
   // Notify before RAUW/deletion so the old use graph can still be traversed.
   // Ordinary IR APIs do not call these notifications. Also include destination
@@ -110,7 +108,8 @@ public:
   // Unknown changes and changes to VM type information require clear().
   LLVM_ABI void invalidate(Value &Changed);
   /// Caller proves the JavaTypeContextPreservation contract. This retains LVI
-  /// and unaffected context entries; ordinary notifications remain conservative.
+  /// and unaffected context entries; ordinary notifications remain
+  /// conservative.
   LLVM_ABI void invalidatePreservingContext(Value &Changed);
   LLVM_ABI void invalidate(ArrayRef<Value *> Changed, bool CFGChanged = false);
   LLVM_ABI void invalidateForCFGChange(Value &Changed);
@@ -121,7 +120,6 @@ public:
                            FunctionAnalysisManager::Invalidator &Inv);
 
 private:
-
   friend class JavaTypeAnalysis;
 
   JavaTypeAnalysisResult(Function &F, DominatorTree &DT, LazyValueInfo &LVI,

@@ -1,4 +1,5 @@
-//===- LVINullEdgeOracle.h - LVI-backed Java null-edge queries ---*- C++ -*-===//
+//===- LVINullEdgeOracle.h - LVI-backed Java null-edge queries ---*- C++
+//-*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -55,9 +56,9 @@ private:
 struct LVINullEdgeOracle {
   LazyValueInfo &LVI;
   LVINullEdgeQuery *Query = nullptr;
-  LLVM_ABI bool operator()(Value *V, BasicBlock *FromBB, BasicBlock *ToBB) const;
+  LLVM_ABI bool operator()(Value *V, BasicBlock *FromBB,
+                           BasicBlock *ToBB) const;
 };
-
 
 } // namespace llvm
 

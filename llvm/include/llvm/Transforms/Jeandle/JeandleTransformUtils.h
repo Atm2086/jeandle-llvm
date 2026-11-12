@@ -314,7 +314,6 @@ inline std::optional<int> getOopHandleLoadId(LoadInst *LI) {
   return jeandle::getOopHandleId(LI->getPointerOperand());
 }
 
-
 } // namespace llvm
 
 #endif // LLVM_TRANSFORMS_JEANDLE_JEANDLEUTILS_H
